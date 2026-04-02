@@ -107,15 +107,24 @@ def fix_dtypes(df: pd.DataFrame, time_sliced: bool = False):
     else:
         int_cols.extend([col for col in df.columns if '_bin_' in col])
         int_cols.extend([col for col in df.columns if col.endswith('_count')])
-    df[int_cols] = df[int_cols].astype('Int64')
-    df[double_cols] = df[double_cols].astype('Float64')
-    df[size_cols] = df[size_cols].astype('Int64')
+    # Use numpy dtypes (float64/int64) instead of nullable pandas types
+    # (Int64/Float64) for performance; groupby on numpy types is 2-5x faster.
+    # NaN represents missing values.
+    for col in int_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
+    for col in double_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
+    for col in size_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
     return df
 
 
 def fix_size_values(df: pd.DataFrame):
     size_cols = [col for col in df.columns if 'size' in col]
-    df[size_cols] = df[size_cols].replace(0, pd.NA)
+    df[size_cols] = df[size_cols].replace(0, np.nan)
     return df
 
 

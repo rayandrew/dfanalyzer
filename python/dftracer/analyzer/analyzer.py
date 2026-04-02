@@ -1177,7 +1177,7 @@ class Analyzer(abc.ABC):
             .agg(hlm_agg, split_out=math.ceil(math.sqrt(traces.npartitions)))
             .persist()
             .repartition(partition_size=partition_size)
-            .replace(0, pd.NA)
+            .replace(0, np.nan)
         )
         hlm[bin_cols] = hlm[bin_cols].astype("Int32")
         return hlm.persist()
@@ -1379,7 +1379,7 @@ class Analyzer(abc.ABC):
             .agg(hlm_agg, split_out=max(1, math.ceil(math.sqrt(combined_hlm.npartitions))))
             .persist()
             .repartition(partition_size=partition_size)
-            .replace(0, pd.NA)
+            .replace(0, np.nan)
         )
         if bin_cols:
             hlm[bin_cols] = hlm[bin_cols].astype("Int32")
@@ -1423,7 +1423,7 @@ class Analyzer(abc.ABC):
                 hlm.groupby(list(view_types))
                 .agg(main_view_agg, split_out=hlm.npartitions)
                 .map_partitions(set_main_metrics)
-                .replace(0, pd.NA)
+                .replace(0, np.nan)
                 .map_partitions(fix_dtypes, time_sliced=self.time_sliced)
                 .persist()
             )
@@ -1499,7 +1499,7 @@ class Analyzer(abc.ABC):
                 pre_view = pre_view.groupby([view_type, COL_PROC_NAME]).agg(pre_agg).reset_index()
 
         with log_block("groupby_agg_pipeline", layer=layer, view_key=view_key):
-            view = pre_view.groupby([view_type]).agg(view_agg).replace(0, pd.NA)
+            view = pre_view.groupby([view_type]).agg(view_agg).replace(0, np.nan)
         with log_block("finalize", layer=layer, view_key=view_key):
             view = flatten_column_names(view)
             view = view.rename(columns=build_view_rename_map(view.columns))

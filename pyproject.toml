@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Analyze, visualize, and understand I/O performance issues in HPC workflows"
 authors = [{ name = "Izzet Yildirim", email = "izzetcyildirim@gmail.com" }]
 maintainers = [{ name = "Izzet Yildirim", email = "izzetcyildirim@gmail.com" }]
-requires-python = ">3.8, <3.13"
+requires-python = ">=3.9, <3.13"
 readme = { file = "README.md", content-type = "text/markdown" }
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -38,7 +38,7 @@ dependencies = [
     "rich~=14.1.0",
     "strenum>=0.4",
     "structlog>=25",
-    "dftracer-utils>=0.0.5",
+    "dftracer-utils @ git+https://github.com/rayandrew/dftracer-utils.git@feat/arrow-schema-resolver",
 ]
 
 [project.optional-dependencies]
