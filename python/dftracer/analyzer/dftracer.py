@@ -10,6 +10,7 @@ import pandas as pd
 import portion as I
 import structlog
 from dftracer.utils import Indexer, TraceReader
+from dftracer.utils.utilities import AggregatorUtility
 from dask.distributed import wait
 
 try:
@@ -37,7 +38,7 @@ from .constants import (
     IOCategory,
 )
 from .types import ReadTraceResult, ViewType
-from .utils.log_utils import log_block
+from .utils.log_utils import console_block, log_block
 
 logger = structlog.get_logger()
 
@@ -404,6 +405,329 @@ class DFTracerAnalyzer(Analyzer):
         super().__init__(preset, **kwargs)
         self.assign_epochs = assign_epochs
 
+    def analyze_trace(
+        self,
+        trace_path,
+        view_types=None,
+        accuracy="optimistic",
+        exclude_characteristics=None,
+        extra_columns=None,
+        extra_columns_fn=None,
+        logical_view_types=False,
+        metric_boundaries=None,
+        unoverlapped_posix_only=False,
+    ):
+        """Override: bypass Dask entirely using PyArrow/pandas for all computation."""
+        import pyarrow as pa
+        import pyarrow.compute as pc
+        from .analysis_utils import (
+            fix_dtypes, set_size_bins, derive_call_stats,
+            set_unique_counts, build_view_rename_map,
+        )
+        from .utils.dask_utils import flatten_column_names
+        from .metrics import set_main_metrics, set_view_metrics, set_cross_layer_metrics
+        from .types import AnalysisResult
+        from .constants import VIEW_TYPES as _VIEW_TYPES
+
+        if view_types is None:
+            view_types = ["proc_name", "time_range"]
+        if exclude_characteristics is None:
+            exclude_characteristics = []
+        if metric_boundaries is None:
+            metric_boundaries = {}
+
+        proc_view_types = self.ensure_proc_view_type(view_types=view_types)
+
+        # --- Read trace & stats (C++ aggregator) ---
+        with console_block("Read trace & stats"):
+            read_result = self.read_trace(trace_path, extra_columns, extra_columns_fn)
+
+            # Validate profile granularity (same check as base class)
+            if read_result.profiles is not None:
+                ptg = read_result.profile_time_granularity or self.profile_time_granularity
+                profiles = self._validate_and_expand_profiles(
+                    profiles=read_result.profiles,
+                    profile_time_granularity=ptg,
+                )
+                read_result.profiles = profiles
+
+            traces_pd = read_result.traces.compute()
+            traces_pd = set_size_bins(traces_pd)
+
+            traces_pd[COL_ACC_PAT] = 0
+
+            from .types import RawStats
+            profiles_pd = read_result.profiles.compute() if read_result.profiles is not None else None
+            profile_count = int(profiles_pd[COL_COUNT].sum()) if profiles_pd is not None and COL_COUNT in profiles_pd.columns else 0
+            trace_count = int(traces_pd[COL_COUNT].sum())
+            raw_stats = RawStats(
+                job_time=(traces_pd[COL_TIME_END].max() - traces_pd[COL_TIME_START].min()) / self.time_resolution if COL_TIME_START in traces_pd.columns else 0,
+                time_granularity=self.time_granularity,
+                time_resolution=self.time_resolution,
+                trace_event_count=trace_count,
+                profile_event_count=profile_count,
+                total_event_count=trace_count + profile_count,
+                unique_file_count=traces_pd['file_hash'].nunique() if 'file_hash' in traces_pd.columns else 0,
+                unique_host_count=traces_pd['host_hash'].nunique() if 'host_hash' in traces_pd.columns else 0,
+                unique_process_count=traces_pd['pid'].nunique() if 'pid' in traces_pd.columns else 0,
+            )
+
+        # --- Compute HLM (pandas groupby) ---
+        with console_block("Compute high-level metrics"):
+            hlm_groupby = list(dict.fromkeys(proc_view_types + ["cat", COL_IO_CAT, COL_ACC_PAT, COL_FUNC_NAME]))
+            view_types_diff = list(set(_VIEW_TYPES).difference(proc_view_types))
+
+            def _compute_hlm_pandas(df):
+                bin_cols = [col for col in df.columns if "_bin_" in col]
+                df = df.assign(
+                    time_sq=df[COL_TIME] ** 2,
+                    size_sq=df[COL_SIZE] ** 2,
+                    time_call_min=df[COL_TIME],
+                    time_call_max=df[COL_TIME],
+                    size_call_min=df[COL_SIZE],
+                    size_call_max=df[COL_SIZE],
+                )
+                agg = {COL_TIME: "sum", COL_COUNT: "sum", COL_SIZE: "sum"}
+                agg.update({col: "sum" for col in bin_cols})
+                for col in view_types_diff:
+                    if col in df.columns:
+                        agg[col] = lambda x: frozenset(x.dropna())
+                agg["time_sq"] = "sum"
+                agg["size_sq"] = "sum"
+                agg["time_call_min"] = "min"
+                agg["time_call_max"] = "max"
+                agg["size_call_min"] = "min"
+                agg["size_call_max"] = "max"
+                result = df.groupby(hlm_groupby).agg(agg)
+                result = result.replace(0, np.nan)
+                if bin_cols:
+                    result[bin_cols] = result[bin_cols].astype("Int32")
+                return result
+
+            trace_hlm = _compute_hlm_pandas(traces_pd)
+
+            profiles_pd = read_result.profiles.compute() if read_result.profiles is not None else None
+            profile_hlm = None
+            if profiles_pd is not None and not profiles_pd.empty:
+                profiles_pd = set_size_bins(profiles_pd)
+                profiles_pd[COL_ACC_PAT] = 0
+                profile_hlm = _compute_hlm_pandas(profiles_pd)
+
+        # --- Compute views (pandas groupby) ---
+        with console_block("Compute views"):
+            hlms = {}
+            main_views = {}
+            main_indexes = {}
+            views = {}
+            view_keys = set()
+
+            def _reconcile_per_layer(t_hlm, p_hlm, condition):
+                """Reconcile trace + profile HLM for a single layer."""
+                lt = t_hlm.copy()
+                if condition:
+                    lt = lt.query(condition)
+                if p_hlm is None:
+                    return lt
+                lp = p_hlm.copy()
+                if condition:
+                    lp = lp.query(condition)
+                if lp.empty:
+                    return lt
+                # Merge: keep profile rows that don't overlap with trace rows
+                lt_reset = lt.reset_index()
+                lp_reset = lp.reset_index()
+                trace_keys = lt_reset[hlm_groupby].drop_duplicates()
+                merged = lp_reset.merge(trace_keys, on=hlm_groupby, how="left", indicator=True)
+                profile_only = merged[merged["_merge"] == "left_only"].drop(columns=["_merge"])
+                if profile_only.empty:
+                    return lt
+                combined = pd.concat([lt_reset, profile_only], ignore_index=True)
+                result = combined.groupby(hlm_groupby).agg(
+                    {col: "sum" for col in combined.columns if col not in hlm_groupby}
+                ).replace(0, np.nan)
+                return result
+
+            for layer, layer_condition in self.preset.layer_defs.items():
+                layer_hlm = _reconcile_per_layer(trace_hlm, profile_hlm, layer_condition)
+
+                # _compute_main_view equivalent
+                size_layers = {cl.lower() for cl in (self.preset.size_layers or [])}
+                if layer.lower() not in size_layers:
+                    size_cols = [c for c in layer_hlm.columns if c.startswith("size")]
+                    layer_hlm = layer_hlm.drop(columns=size_cols, errors='ignore')
+                    if "file_name" in layer_hlm.columns:
+                        layer_hlm = layer_hlm.drop(columns=["file_name"])
+
+                layer_hlm = self.set_layer_metrics(
+                    layer_hlm.reset_index(),
+                    derived_metrics=self.preset.derived_metrics[layer],
+                    size_derived_metrics=(self.preset.size_derived_metrics or {}).get(layer.lower(), []),
+                )
+
+                main_agg = {}
+                for col in layer_hlm.columns:
+                    if col in proc_view_types or col in ["cat", COL_IO_CAT, COL_ACC_PAT, COL_FUNC_NAME]:
+                        continue
+                    if any(map(col.endswith, set(_VIEW_TYPES).difference(proc_view_types))):
+                        main_agg[col] = lambda x: frozenset(x.dropna())
+                    elif col.endswith("_call_min"):
+                        main_agg[col] = "min"
+                    elif col.endswith("_call_max"):
+                        main_agg[col] = "max"
+                    else:
+                        main_agg[col] = "sum"
+
+                layer_main_view = layer_hlm.groupby(list(proc_view_types)).agg(main_agg)
+                layer_main_view = set_main_metrics(layer_main_view)
+                layer_main_view = layer_main_view.replace(0, np.nan)
+                layer_main_view = fix_dtypes(layer_main_view, time_sliced=self.time_sliced)
+
+                layer_main_index = layer_main_view.index.to_frame().reset_index(drop=True)
+
+                # _compute_view for each view permutation
+                layer_views = {}
+                for view_key in self.view_permutations(view_types=proc_view_types):
+                    view_type = view_key[-1]
+                    parent_records = layer_main_view
+                    for parent_vt in view_key[:-1]:
+                        parent_records = parent_records.query(
+                            f"{parent_vt} in @indices",
+                            local_dict={"indices": layer_views[(parent_vt,)].index},
+                        )
+
+                    records = parent_records.reset_index()
+                    # Pre-grouping
+                    if view_type != COL_PROC_NAME:
+                        pre_agg = {}
+                        for col in records.columns:
+                            if col in (view_type, COL_PROC_NAME):
+                                continue
+                            if col.endswith("_call_min"):
+                                pre_agg[col] = "min"
+                            elif col.endswith("_call_max"):
+                                pre_agg[col] = "max"
+                            else:
+                                pre_agg[col] = "sum"
+                        records = records.groupby([view_type, COL_PROC_NAME]).agg(pre_agg).reset_index()
+
+                    # Build view agg dict
+                    view_agg = {}
+                    local_view_types = [c for c in layer_main_view.index.names if c != view_type]
+                    view_types_diff_v = set(_VIEW_TYPES).difference(proc_view_types)
+                    for col in records.columns:
+                        if col == view_type or col == COL_PROC_NAME:
+                            continue
+                        if "_bin_" in col:
+                            view_agg[col] = ["sum"]
+                        elif any(map(col.endswith, view_types_diff_v)):
+                            view_agg[col] = [lambda x: frozenset(x.dropna())]
+                        elif col.endswith("_sq"):
+                            view_agg[col] = ["sum"]
+                        elif col.endswith("_call_min"):
+                            view_agg[col] = ["min"]
+                        elif col.endswith("_call_max"):
+                            view_agg[col] = ["max"]
+                        elif pd.api.types.is_numeric_dtype(records[col].dtype):
+                            view_agg[col] = ["sum", "min", "max", "mean", "std"]
+                        elif col in local_view_types:
+                            view_agg[col] = [lambda x: frozenset(x.dropna())]
+
+                    view_agg.update({col: [lambda x: frozenset(x.dropna())] for col in local_view_types if col not in view_agg})
+
+                    view = records.groupby([view_type]).agg(view_agg).replace(0, np.nan)
+                    view = flatten_column_names(view)
+                    view = view.rename(columns=build_view_rename_map(view.columns))
+                    view = derive_call_stats(view)
+                    view = set_unique_counts(view, layer=layer)
+                    view = fix_dtypes(view, time_sliced=self.time_sliced)
+
+                    layer_views[view_key] = view
+
+                hlms[layer] = layer_hlm
+                main_views[layer] = layer_main_view
+                main_indexes[layer] = layer_main_index
+                views[layer] = layer_views
+                view_keys.update(layer_views.keys())
+
+        # --- Process views ---
+        with console_block("Process views"):
+            flat_views = {}
+            for layer in views:
+                for view_key in views[layer]:
+                    view = views[layer][view_key].copy()
+                    view.columns = view.columns.map(lambda col: layer.lower() + "_" + col)
+                    if view_key in flat_views:
+                        flat_views[view_key] = flat_views[view_key].merge(view, how="outer", left_index=True, right_index=True)
+                    else:
+                        flat_views[view_key] = view
+
+            for view_key in flat_views:
+                view_type = view_key[-1]
+                top_layer = list(self.preset.layer_defs)[0]
+                time_proc_suffix = "time_sum" if self.is_view_process_based(view_key) else "time_proc_max"
+                time_boundary = flat_views[view_key][f"{top_layer}_{time_proc_suffix}"].sum()
+                metric_boundaries.setdefault(view_type, {})
+                for layer in self.preset.layer_defs:
+                    metric_boundaries[view_type][f"{layer}_{time_proc_suffix}"] = time_boundary
+                flat_views[view_key] = self._process_flat_view(
+                    flat_view=flat_views[view_key],
+                    view_key=view_key,
+                    metric_boundaries=metric_boundaries,
+                )
+
+            if self.checkpoint:
+                for view_key, fv in flat_views.items():
+                    name = self.get_checkpoint_name("flat_view", *list(view_key))
+                    path = self.get_checkpoint_path(name)
+                    fv_out = fv.copy()
+                    for col in fv_out.select_dtypes(include=['object']).columns:
+                        fv_out[col] = fv_out[col].apply(lambda x: str(x) if isinstance(x, frozenset) else x)
+                    fv_out.to_parquet(f"{path}.parquet")
+
+        # Wrap pandas DataFrames so they support .compute() for compatibility
+        class _PandasCompat:
+            """Wraps a pandas DataFrame to add .compute() → returns self."""
+            def __init__(self, df):
+                self._df = df
+            def compute(self, **kwargs):
+                return self._df
+            def __getattr__(self, name):
+                return getattr(self._df, name)
+            def __getitem__(self, key):
+                return self._df[key]
+            def __len__(self):
+                return len(self._df)
+
+        def _wrap(v):
+            if isinstance(v, pd.DataFrame):
+                return _PandasCompat(v)
+            return v
+
+        dask_hlms = {k: _wrap(v) for k, v in hlms.items()}
+        dask_main_views = {k: _wrap(v) for k, v in main_views.items()}
+        dask_views = {}
+        for layer in views:
+            dask_views[layer] = {k: _wrap(v) for k, v in views[layer].items()}
+
+        result = AnalysisResult(
+            _hlms=dask_hlms,
+            _main_views=dask_main_views,
+            _metric_boundaries=metric_boundaries,
+            additional_metrics={
+                view_type: list(metrics.keys())
+                for view_type, metrics in (self.preset.additional_metrics or {}).items()
+            },
+            checkpoint_dir=self.checkpoint_dir,
+            flat_views=flat_views,
+            layers=self.layers,
+            raw_stats=raw_stats,
+            view_types=proc_view_types,
+            views=dask_views,
+        )
+        result._read_result = read_result
+        result.view_types = view_types
+        return result
+
     def _register_dask_plugin(self):
         """Register the DFTracer Dask worker plugin if a distributed client is active.
 
@@ -442,7 +766,7 @@ class DFTracerAnalyzer(Analyzer):
         except (ValueError, ImportError):
             pass
 
-    def read_trace(self, trace_path, extra_columns, extra_columns_fn):
+    def read_trace_legacy(self, trace_path, extra_columns, extra_columns_fn):
         with log_block("glob_files"):
             pfw_pattern, pfw_gz_pattern = [], []
             if os.path.isdir(trace_path):
@@ -539,6 +863,277 @@ class DFTracerAnalyzer(Analyzer):
             exit(1)
         return ReadTraceResult(
             traces=self._rename_columns(traces),
+            profiles=profiles,
+            profile_time_granularity=self.profile_time_granularity if profiles is not None else None,
+            system_metrics=system_metrics,
+        )
+
+    def _read_metadata(self, trace_path):
+        """Quick pass to extract hash tables (file/host/string hashes) from trace metadata."""
+        import pyarrow as pa
+        from dftracer.utils.arrow import ArrowBatch
+
+        pfw_files = []
+        if os.path.isdir(trace_path):
+            pfw_files = glob.glob(os.path.join(trace_path, "*.pfw")) + glob.glob(os.path.join(trace_path, "*.pfw.gz"))
+        elif trace_path.endswith((".pfw", ".pfw.gz")):
+            pfw_files = glob.glob(trace_path) if "*" in trace_path else [trace_path]
+
+        file_hashes = {}
+        host_hashes = {}
+        string_hashes = {}
+        proc_metadata = {}
+
+        for f in pfw_files:
+            reader = TraceReader(f)
+            for capsule in reader.iter_arrow(batch_size=10000, normalize=True):
+                batch = ArrowBatch(capsule)._to_pa_batch()
+                if 'type' not in batch.column_names:
+                    continue
+                type_col = batch.column('type')
+                for i in range(batch.num_rows):
+                    t = type_col[i].as_py()
+                    if t is None:
+                        continue
+                    if t in (TYPE_FILE_HASH, TYPE_HOST_HASH, TYPE_STRING_HASH):
+                        h = batch.column('hash')[i].as_py()
+                        n = batch.column('name')[i].as_py()
+                        if h and n:
+                            if t == TYPE_FILE_HASH:
+                                file_hashes[h] = n
+                            elif t == TYPE_HOST_HASH:
+                                host_hashes[h] = n
+                            else:
+                                string_hashes[h] = n
+                    elif t == TYPE_PROC_METADATA:
+                        h = batch.column('hash')[i].as_py()
+                        n = batch.column('name')[i].as_py()
+                        if h and n:
+                            proc_metadata[h] = n
+
+        self._file_hashes_dict = file_hashes
+        self._host_hashes_dict = host_hashes
+        self._string_hashes_dict = string_hashes
+        self._proc_metadata_dict = proc_metadata
+
+    def read_trace(self, trace_path, extra_columns=None, extra_columns_fn=None):
+        """Read and aggregate traces using C++ AggregatorUtility.
+
+        Returns aggregated HLM-like pandas DataFrame directly, bypassing
+        Dask for the heavy computation. Metadata hash tables are read
+        in a separate quick pass.
+        """
+        import pyarrow as pa
+        from dftracer.utils import Runtime
+
+        with log_block("glob_files"):
+            pfw_pattern, pfw_gz_pattern = [], []
+            if os.path.isdir(trace_path):
+                pfw_pattern = glob.glob(os.path.join(trace_path, "*.pfw"))
+                pfw_gz_pattern = glob.glob(os.path.join(trace_path, "*.pfw.gz"))
+            elif trace_path.endswith(".pfw.gz"):
+                pfw_gz_pattern = glob.glob(trace_path) if "*" in trace_path else [trace_path]
+            elif trace_path.endswith(".pfw"):
+                pfw_pattern = glob.glob(trace_path) if "*" in trace_path else [trace_path]
+            all_files = pfw_pattern + pfw_gz_pattern
+            if not all_files:
+                raise FileNotFoundError("No matching .pfw or .pfw.gz files found.")
+
+        if pfw_gz_pattern:
+            with log_block("create_index"):
+                db.from_sequence(pfw_gz_pattern).map(create_index).compute()
+
+        with log_block("read_metadata"):
+            self._read_metadata(trace_path)
+
+        with log_block("aggregate"):
+            total_cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
+            rt = Runtime(threads=total_cpus)
+            agg = AggregatorUtility(runtime=rt)
+            time_interval_ms = self.time_granularity * self.time_resolution / 1000.0
+            trace_dir = trace_path if os.path.isdir(trace_path) else os.path.dirname(trace_path)
+            arrow_result = agg.process(
+                trace_dir,
+                time_interval_ms=time_interval_ms,
+                custom_metric_fields=['offset'],
+            )
+            rt.shutdown()
+
+        with log_block("to_pandas"):
+            # Batches may have different schemas (e.g. events lack offset columns
+            # that profiles have). Use concat_tables with promote to unify.
+            from dftracer.utils.arrow import ArrowBatch
+            pa_batches = [pa.record_batch(b) for b in arrow_result._batches]
+            if pa_batches:
+                tables = [pa.Table.from_batches([b]) for b in pa_batches]
+                pa_table = pa.concat_tables(tables, promote_options='default')
+            else:
+                pa_table = pa.table({})
+            df = pa_table.to_pandas()
+            logger.info("Aggregated traces", rows=len(df), cols=len(df.columns))
+
+        with log_block("normalize"):
+            # Clamp uninitialized min values (uint64 max → NaN)
+            uint64_max = np.iinfo(np.uint64).max
+            for col in ['dur_min', 'size_min']:
+                if col in df.columns:
+                    df.loc[df[col] == uint64_max, col] = np.nan
+
+            # Rename hash columns before resolving so _set_proc_names can find them
+            if 'fhash' in df.columns:
+                df = df.rename(columns={'fhash': 'file_hash'})
+            if 'hhash' in df.columns:
+                df = df.rename(columns={'hhash': 'host_hash'})
+
+            # Resolve hash → name
+            if 'file_hash' in df.columns:
+                df[COL_FILE_NAME] = df['file_hash'].map(self._file_hashes_dict)
+            if 'host_hash' in df.columns:
+                df[COL_HOST_NAME] = df['host_hash'].map(self._host_hashes_dict)
+            df = self._set_proc_names(df)
+
+            # Lowercase cat to match layer conditions
+            if 'cat' in df.columns:
+                df['cat'] = df['cat'].str.lower()
+
+            # IO category from function name
+            if 'name' in df.columns:
+                df[COL_IO_CAT] = df['name'].map(get_io_cat).astype('int8')
+
+            # Rename to HLM schema
+            rename = {
+                'name': COL_FUNC_NAME,
+                'dur_total': COL_TIME,
+                'count': COL_COUNT,
+                'size_total': COL_SIZE,
+                'dur_min': 'time_call_min',
+                'dur_max': 'time_call_max',
+                'dur_std': 'time_std',
+                'dur_mean': 'time_mean',
+                'size_min': 'size_call_min',
+                'size_max': 'size_call_max',
+                'size_std': 'size_std',
+                'size_mean': 'size_mean',
+                'ts': COL_TIME_START,
+                'te': COL_TIME_END,
+            }
+            df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+
+            # Time normalization: make time_bucket relative
+            if 'time_bucket' in df.columns:
+                time_origin = df['time_bucket'].min()
+                bucket_size = int(time_interval_ms * 1000)  # to microseconds
+                df[COL_TIME_RANGE] = ((df['time_bucket'] - time_origin) // bucket_size).astype('int64')
+                df = df.drop(columns=['time_bucket'])
+            if COL_TIME_START in df.columns:
+                if 'time_origin' not in dir():
+                    time_origin = df[COL_TIME_START].min()
+                df[COL_TIME_START] = df[COL_TIME_START] - time_origin
+                df[COL_TIME_END] = df[COL_TIME_END] - time_origin
+
+            # Convert duration from microseconds to time_resolution units
+            if COL_TIME in df.columns:
+                df[COL_TIME] = df[COL_TIME].astype('float64') / self.time_resolution
+            for col in ['time_call_min', 'time_call_max']:
+                if col in df.columns:
+                    df[col] = df[col].astype('float64') / self.time_resolution
+
+            df[COL_ACC_PAT] = 0
+
+            # Replace zero size/offset with NaN
+            if COL_SIZE in df.columns:
+                df[COL_SIZE] = df[COL_SIZE].replace(0, np.nan)
+
+        # Filtering happens in postread_trace (called by analyze_trace),
+        # not here — so read_trace output matches legacy behavior.
+
+        # Split by batch_type: 0=EVENT, 1=PROFILE, 2=SYSTEM
+        events_df = df[df['batch_type'] == 0].drop(columns=['batch_type']) if 'batch_type' in df.columns else df
+        profiles_df = df[df['batch_type'] == 1].drop(columns=['batch_type']) if 'batch_type' in df.columns else pd.DataFrame()
+        system_df = df[df['batch_type'] == 2].drop(columns=['batch_type']) if 'batch_type' in df.columns else pd.DataFrame()
+
+        traces = dd.from_pandas(events_df, npartitions=1)
+
+        if not profiles_df.empty:
+            # Fix profile time_end: C++ used time_granularity but profiles use profile_time_granularity
+            ptg_us = int(self.profile_time_granularity * self.time_resolution)
+            if COL_TIME_START in profiles_df.columns and COL_TIME_END in profiles_df.columns:
+                profiles_df[COL_TIME_END] = profiles_df[COL_TIME_START] + ptg_us
+
+            # Add time_min/time_max/size_min/size_max aliases expected by _expand_profile_buckets
+            if 'time_call_min' in profiles_df.columns:
+                profiles_df['time_min'] = profiles_df['time_call_min']
+            if 'time_call_max' in profiles_df.columns:
+                profiles_df['time_max'] = profiles_df['time_call_max']
+            if 'size_call_min' in profiles_df.columns:
+                profiles_df['size_min'] = profiles_df['size_call_min']
+            if 'size_call_max' in profiles_df.columns:
+                profiles_df['size_max'] = profiles_df['size_call_max']
+
+            # offset: custom metrics may provide offset_min/max, or fall back to NA
+            for ofs_col in ['offset_min', 'offset_max']:
+                if ofs_col not in profiles_df.columns:
+                    profiles_df[ofs_col] = pd.NA
+                else:
+                    # Clamp uint64 max to NA
+                    uint64_max = np.iinfo(np.uint64).max
+                    profiles_df.loc[profiles_df[ofs_col] == uint64_max, ofs_col] = pd.NA
+
+            # Match legacy _standardize_profiles nullable dtypes
+            str_cols = [COL_FUNC_NAME, COL_FILE_NAME, COL_HOST_NAME, COL_PROC_NAME,
+                        'cat', 'file_hash', 'host_hash']
+            for col in str_cols:
+                if col in profiles_df.columns:
+                    profiles_df[col] = profiles_df[col].astype('string')
+            int_cols = [COL_COUNT, COL_SIZE, 'size_call_min', 'size_call_max',
+                        'size_min', 'size_max', COL_TIME_RANGE, 'pid', 'tid']
+            for col in int_cols:
+                if col in profiles_df.columns:
+                    profiles_df[col] = pd.to_numeric(profiles_df[col], errors='coerce').astype('Int64')
+            profiles = dd.from_pandas(profiles_df, npartitions=1)
+        else:
+            profiles = None
+
+        # System events need raw per-metric fields (CPU %, memory values)
+        # that the aggregator doesn't preserve. Read them via TraceReader.
+        has_system = not system_df.empty
+        system_metrics = None
+        if has_system:
+            from dftracer.utils.arrow import ArrowBatch
+            sys_batches = []
+            trace_dir = trace_path if os.path.isdir(trace_path) else os.path.dirname(trace_path)
+            all_files = glob.glob(os.path.join(trace_dir, "*.pfw")) + glob.glob(os.path.join(trace_dir, "*.pfw.gz"))
+            for f in all_files:
+                reader = TraceReader(f)
+                for capsule in reader.iter_arrow(batch_size=10000, normalize=True):
+                    batch = ArrowBatch(capsule)._to_pa_batch()
+                    if 'type' in batch.column_names:
+                        import pyarrow.compute as pc
+                        mask = pc.equal(batch.column('type'), TYPE_SYSTEM)
+                        filtered = batch.filter(mask)
+                        if filtered.num_rows > 0:
+                            sys_batches.append(filtered)
+            if sys_batches:
+                sys_table = pa.concat_tables(
+                    [pa.Table.from_batches([b]) for b in sys_batches],
+                    promote_options='default',
+                )
+                sys_df = sys_table.to_pandas()
+                # Resolve hashes + set proc_names
+                if 'host_hash' in sys_df.columns:
+                    sys_df[COL_HOST_NAME] = sys_df['host_hash'].map(self._host_hashes_dict)
+                sys_df = self._set_proc_names(sys_df)
+                # Apply time normalization
+                if 'ts' in sys_df.columns:
+                    sys_df['ts'] = sys_df['ts'] - time_origin
+                    sys_df['te'] = sys_df.get('te', sys_df['ts'])
+                    if 'te' in sys_df.columns:
+                        sys_df['te'] = sys_df['te'] - time_origin
+                system_metrics = dd.from_pandas(sys_df, npartitions=1)
+                system_metrics = self._standardize_system(system_metrics, time_origin=0)
+
+        return ReadTraceResult(
+            traces=traces,
             profiles=profiles,
             profile_time_granularity=self.profile_time_granularity if profiles is not None else None,
             system_metrics=system_metrics,
