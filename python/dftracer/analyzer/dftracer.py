@@ -22,6 +22,14 @@ from dask.distributed import Client, get_client, wait
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .analyzer import Analyzer, HLM_AGG, HLM_EXTRA_COLS
+from .analysis_utils import (
+    build_view_rename_map,
+    derive_call_stats,
+    fix_dtypes,
+    fix_std_cols,
+    set_unique_counts,
+)
+from .utils.dask_agg import unique_set, unique_set_flatten
 from .constants import (
     COL_ACC_PAT,
     COL_COUNT,
@@ -1150,7 +1158,114 @@ class DFTracerAnalyzer(Analyzer):
                 drop_cols.append(col)
         if drop_cols:
             records = records.drop(columns=drop_cols, errors="ignore")
-        return super()._compute_view(layer, records, view_key, view_type, view_types)
+
+        # Arrow-based view computation
+        view_types_diff = set(VIEW_TYPES).difference(view_types)
+        local_view_types = records.index._meta.names
+        local_view_types_diff = set(local_view_types).difference([view_type])
+
+        view_agg = {}
+        for col in records.columns:
+            if "_bin_" in col:
+                view_agg[col] = ["sum"]
+            elif any(map(col.endswith, view_types_diff)):
+                view_agg[col] = [unique_set_flatten()]
+            elif col in it.chain.from_iterable(self.logical_views.values()):
+                view_agg[col] = [unique_set_flatten()]
+            elif col.endswith("_sq"):
+                view_agg[col] = ["sum"]
+            elif col.endswith("_call_min"):
+                view_agg[col] = ["min"]
+            elif col.endswith("_call_max"):
+                view_agg[col] = ["max"]
+            elif pd.api.types.is_numeric_dtype(records[col].dtype):
+                view_agg[col] = ["sum", "min", "max", "mean", "std"]
+            else:
+                raise TypeError(
+                    f"Unsupported dtype '{records[col].dtype}' for column '{col}'"
+                )
+        view_agg.update({col: [unique_set()] for col in local_view_types_diff})
+
+        std_cols = [c for c, a in view_agg.items() if "std" in a]
+
+        # Gather main_view to a pandas DataFrame once per layer, cache it across
+        # view_keys. Two-view layouts (proc_name, time_range) would otherwise
+        # pay the ~10s Dask->pandas gather twice.
+        cache = getattr(self, "_main_view_pdf_cache", None)
+        if cache is None:
+            cache = {}
+            self._main_view_pdf_cache = cache
+        cache_key = (layer, id(records))
+        if cache_key not in cache:
+            cache[cache_key] = records.map_partitions(
+                fix_std_cols, std_cols=std_cols
+            ).compute()
+        records_pdf = cache[cache_key]
+        pre_pdf = records_pdf.reset_index()
+
+        view_pdf = self._arrow_view_groupby(pre_pdf, view_type, view_agg)
+        view_pdf = view_pdf.replace(0, pd.NA)
+        view_pdf = view_pdf.rename(columns=build_view_rename_map(view_pdf.columns))
+
+        # Finalize eagerly in pandas
+        view_pdf = derive_call_stats(view_pdf)
+        view_pdf = set_unique_counts(view_pdf, layer=layer)
+        view_pdf = fix_dtypes(view_pdf, time_sliced=self.time_sliced)
+
+        return dd.from_pandas(view_pdf, npartitions=1).persist()
+
+    @staticmethod
+    def _arrow_view_groupby(pdf: pd.DataFrame, view_type: str, view_agg: dict) -> pd.DataFrame:
+        """Groupby+aggregate pandas DataFrame using pyarrow for standard aggs.
+
+        Falls back to pandas only for ``unique_set`` / ``unique_set_flatten``
+        (custom Python aggregations Arrow can't express). Output column names
+        match the base class pipeline after ``flatten_column_names``:
+        ``col_sum``, ``col_min``, ``col_max``, ``col_mean``, ``col_std``.
+        """
+        from betterset import BetterSet as S
+
+        arrow_aggs = []
+        set_cols = {}
+        for col, aggs in view_agg.items():
+            if col not in pdf.columns:
+                continue
+            for a in aggs:
+                if isinstance(a, str):
+                    arrow_fn = "stddev" if a == "std" else a
+                    arrow_aggs.append((col, arrow_fn))
+                else:
+                    set_cols[col] = a
+
+        keep_cols = [view_type] + [c for c, _ in arrow_aggs]
+        keep_cols = list(dict.fromkeys(keep_cols))
+        arrow_pdf = pdf[keep_cols]
+
+        tbl = pa.Table.from_pandas(arrow_pdf, preserve_index=False)
+        result = tbl.group_by([view_type]).aggregate(arrow_aggs)
+        out = result.to_pandas(types_mapper=pd.ArrowDtype)
+
+        rename = {}
+        for c in out.columns:
+            if c.endswith("_stddev"):
+                rename[c] = c[: -len("_stddev")] + "_std"
+        if rename:
+            out = out.rename(columns=rename)
+
+        if set_cols:
+            # Apply the dd.Aggregation's chunk fn to the SeriesGroupBy as
+            # Dask itself would. Yields a Series indexed by group key.
+            for col, agg in set_cols.items():
+                if col not in pdf.columns:
+                    continue
+                sgb = pdf.groupby(view_type)[col]
+                chunk = getattr(agg, "chunk", None)
+                series = chunk(sgb) if chunk is not None else sgb.apply(S.flatten)
+                series = series.reset_index().rename(columns={col: f"{col}_unique"})
+                out = out.merge(series, on=view_type, how="left")
+
+        out = out.set_index(view_type)
+        return out
 
     @staticmethod
     def _normalize_arrow_dtypes(df: pd.DataFrame) -> pd.DataFrame:
