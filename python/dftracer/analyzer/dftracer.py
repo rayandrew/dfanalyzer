@@ -247,7 +247,7 @@ def _ipc_to_pandas(ipc_bytes):
     for i, field in enumerate(table.schema):
         if pa.types.is_dictionary(field.type):
             table = table.set_column(i, field.name, table.column(i).cast(pa.string()))
-    return table.to_pandas(types_mapper=pd.ArrowDtype)
+    return table.to_pandas()
 
 
 def _worker_scan_to_ipc(files, index_path, time_granularity, time_resolution, query):
@@ -936,24 +936,23 @@ class DFTracerAnalyzer(Analyzer):
             self._dask_client = dask_client
 
         with log_block("build_dask_dataframe"):
-            _str = pd.ArrowDtype(pa.string())
             events_meta = pd.DataFrame({
-                "cat": pd.Series(dtype=_str),
-                COL_FUNC_NAME: pd.Series(dtype=_str),
+                "cat": pd.Series(dtype="object"),
+                COL_FUNC_NAME: pd.Series(dtype="object"),
                 "pid": pd.Series(dtype="int64"),
                 "tid": pd.Series(dtype="int64"),
-                "file_hash": pd.Series(dtype=_str),
-                "host_hash": pd.Series(dtype=_str),
-                COL_FILE_NAME: pd.Series(dtype=_str),
-                COL_HOST_NAME: pd.Series(dtype=_str),
-                COL_PROC_NAME: pd.Series(dtype=_str),
+                "file_hash": pd.Series(dtype="object"),
+                "host_hash": pd.Series(dtype="object"),
+                COL_FILE_NAME: pd.Series(dtype="object"),
+                COL_HOST_NAME: pd.Series(dtype="object"),
+                COL_PROC_NAME: pd.Series(dtype="object"),
                 COL_IO_CAT: pd.Series(dtype="int64"),
                 COL_ACC_PAT: pd.Series(dtype="int64"),
                 COL_COUNT: pd.Series(dtype="int64"),
-                COL_TIME: pd.Series(dtype="double[pyarrow]"),
+                COL_TIME: pd.Series(dtype="float64"),
                 COL_SIZE: pd.Series(dtype="int64"),
-                "time_min": pd.Series(dtype="double[pyarrow]"),
-                "time_max": pd.Series(dtype="double[pyarrow]"),
+                "time_min": pd.Series(dtype="float64"),
+                "time_max": pd.Series(dtype="float64"),
                 "size_min": pd.Series(dtype="int64"),
                 "size_max": pd.Series(dtype="int64"),
                 COL_TIME_RANGE: pd.Series(dtype="int64"),
@@ -977,11 +976,23 @@ class DFTracerAnalyzer(Analyzer):
                 else dd.from_pandas(events_meta, npartitions=1)
             )
 
-            profile_delayed = [
-                dask.delayed(_extract_and_decode)(dask.delayed(f), "profiles")
+            def _has_data(result_dict, key):
+                return result_dict[key] is not None
+
+            has_profiles_futures = [
+                dask_client.submit(_has_data, f, "profiles", pure=False)
                 for f in event_futures
             ]
-            profiles = dd.from_delayed(profile_delayed, meta=events_meta) if profile_delayed else None
+            has_profiles = any(dask_client.gather(has_profiles_futures))
+
+            if has_profiles:
+                profile_delayed = [
+                    dask.delayed(_extract_and_decode)(dask.delayed(f), "profiles")
+                    for f in event_futures
+                ]
+                profiles = dd.from_delayed(profile_delayed, meta=events_meta)
+            else:
+                profiles = None
             system_metrics = None
 
         self._file_hashes = pd.DataFrame(columns=["name"])
@@ -1012,27 +1023,70 @@ class DFTracerAnalyzer(Analyzer):
         hlm_agg["size_call_min"] = "min"
         hlm_agg["size_call_max"] = "max"
 
-        partial_futures = [
-            self._dask_client.submit(_worker_hlm, f, data_type, hlm_groupby, hlm_agg, pure=False)
-            for f in self._worker_ipc_futures
-        ]
-        partial_results = self._dask_client.gather(partial_futures)
-        non_empty = [r for r in partial_results if not r.empty]
-        if not non_empty:
+        import pyarrow.compute as pc
+
+        ipc_results = self._dask_client.gather(self._worker_ipc_futures)
+        tables = []
+        for r in ipc_results:
+            ipc_bytes = r[data_type]
+            if ipc_bytes is None:
+                continue
+            reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
+            table = reader.read_all()
+            if table.num_rows == 0:
+                continue
+            for i, field in enumerate(table.schema):
+                if pa.types.is_dictionary(field.type):
+                    table = table.set_column(i, field.name, table.column(i).cast(pa.string()))
+            tables.append(table)
+
+        if not tables:
+            return None
+
+        combined = pa.concat_tables(tables)
+
+        time_col = combined.column("time")
+        size_col = combined.column("size")
+        combined = combined.append_column("time_sq", pc.multiply(time_col, time_col))
+        size_filled = pc.if_else(pc.is_null(size_col), pa.scalar(0, pa.int64()), size_col)
+        combined = combined.append_column("size_sq", pc.multiply(size_filled, size_filled))
+        combined = combined.append_column("time_call_min", time_col)
+        combined = combined.append_column("time_call_max", time_col)
+        combined = combined.append_column("size_call_min", size_col)
+        combined = combined.append_column("size_call_max", size_col)
+
+        available_groupby = [c for c in hlm_groupby if c in combined.column_names]
+        if not available_groupby:
             return dd.from_pandas(pd.DataFrame(), npartitions=1)
-        combined = pd.concat(non_empty, ignore_index=True)
 
-        if combined.empty:
-            return dd.from_pandas(combined, npartitions=1)
+        agg_specs = []
+        for col, agg_fn in hlm_agg.items():
+            if col in combined.column_names and agg_fn in ("sum", "min", "max"):
+                agg_specs.append((col, agg_fn))
 
-        available_groupby = [c for c in hlm_groupby if c in combined.columns]
-        merge_agg = {col: agg for col, agg in hlm_agg.items() if col in combined.columns}
-        hlm = combined.groupby(available_groupby, as_index=False).agg(merge_agg)
+        merged = combined.group_by(available_groupby).aggregate(agg_specs)
+
+        rename = {}
+        for col, agg_fn in agg_specs:
+            rename[f"{col}_{agg_fn}"] = col
+        merged = merged.rename_columns([rename.get(c, c) for c in merged.column_names])
+
+        hlm = merged.to_pandas()
+        if "cat" in hlm.columns:
+            hlm["cat"] = hlm["cat"].str.lower()
+        for col in hlm.select_dtypes(include=["string"]).columns:
+            hlm[col] = hlm[col].astype("object")
+        for col in hlm.select_dtypes(include=["int64", "uint64"]).columns:
+            hlm[col] = hlm[col].astype("Int64")
+        for col in hlm.select_dtypes(include=["float64"]).columns:
+            hlm[col] = hlm[col].astype("Float64")
         hlm = hlm.replace(0, pd.NA)
         for col in bin_cols:
             if col in hlm.columns:
                 hlm[col] = hlm[col].astype("Int32")
-        return dd.from_pandas(hlm, npartitions=max(1, len(hlm) // 100000))
+        available_groupby = [c for c in hlm_groupby if c in hlm.columns]
+        hlm = hlm.set_index(available_groupby).sort_index()
+        return dd.from_delayed([dask.delayed(lambda x: x)(hlm)], meta=hlm.iloc[:0])
 
     def _compute_high_level_metrics(self, traces, view_types, partition_size):
         result = self._distributed_hlm("events", view_types, traces)
@@ -1044,13 +1098,47 @@ class DFTracerAnalyzer(Analyzer):
         result = self._distributed_hlm("profiles", view_types, profiles)
         if result is not None:
             return result
+        if profiles is None:
+            return None
         return super()._compute_profile_hlm(profiles, view_types, partition_size)
+
+    def _compute_view(self, layer, records, view_key, view_type, view_types):
+        from .constants import VIEW_TYPES
+        import itertools as it
+
+        keep_object_cols = (
+            set(VIEW_TYPES)
+            | set(view_types)
+            | set(it.chain.from_iterable(self.logical_views.values()))
+        )
+        drop_cols = []
+        for col in records.columns:
+            dtype_str = str(records[col].dtype)
+            if dtype_str in ("string", "category"):
+                records[col] = records[col].astype("object")
+                dtype_str = "object"
+            if dtype_str == "object" and col not in keep_object_cols and not any(
+                col.endswith(vt) for vt in keep_object_cols
+            ):
+                drop_cols.append(col)
+        if drop_cols:
+            records = records.drop(columns=drop_cols, errors="ignore")
+        return super()._compute_view(layer, records, view_key, view_type, view_types)
+
+    @staticmethod
+    def _normalize_arrow_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+        for col in df.select_dtypes(include=["category"]).columns:
+            df[col] = df[col].astype("object")
+        if "cat" in df.columns:
+            df["cat"] = df["cat"].str.lower()
+        return df
 
     def postread_trace(
         self,
         traces: dd.DataFrame,
         view_types: List[ViewType],
     ) -> dd.DataFrame:
+        traces = traces.map_partitions(self._normalize_arrow_dtypes)
         with log_block("filter_files"):
             traces = traces[
                 traces[COL_FILE_NAME].isna() | ~traces[COL_FILE_NAME].str.contains("|".join(IGNORED_FILE_PATTERNS))
@@ -1500,9 +1588,11 @@ class DFTracerAnalyzer(Analyzer):
 
     @staticmethod
     def _set_proc_names(df: pd.DataFrame):
-        host_component = df[COL_HOST_NAME] if COL_HOST_NAME in df.columns else pd.Series(pd.NA, index=df.index)
+        if COL_PROC_NAME in df.columns and df[COL_PROC_NAME].notna().any():
+            return df
+        host_component = df[COL_HOST_NAME].astype(str) if COL_HOST_NAME in df.columns else pd.Series(pd.NA, index=df.index)
         if "host_hash" in df.columns:
-            host_component = host_component.fillna(df["host_hash"])
+            host_component = host_component.fillna(df["host_hash"].astype(str))
         df[COL_PROC_NAME] = (
             "app#"
             + host_component.fillna("unknown").astype(str)
