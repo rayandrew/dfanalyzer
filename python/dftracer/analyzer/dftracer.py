@@ -284,6 +284,126 @@ def _ipc_to_pandas(ipc_bytes):
     return table.to_pandas()
 
 
+def _partial_arrow_view_groupby(
+    df,
+    view_type,
+    full_cols,
+    sum_cols,
+    min_cols,
+    max_cols,
+    set_cols_items,
+):
+    """Per-partition Arrow groupby emitting mergeable partial aggregates.
+
+    full_cols => five partial cols per input: sum, count, sumsq, min, max.
+    sum/min/max_cols emit a single col each.
+    set_cols_items is a list of (col_name, dd.Aggregation) whose chunk fn
+    produces the per-group BetterSet (handled via pandas; Arrow can't express
+    a BetterSet union).
+    """
+    from betterset import BetterSet as S
+
+    view_type_in_index = (
+        isinstance(df.index, pd.MultiIndex) and view_type in df.index.names
+    ) or (df.index.name == view_type)
+    work = df.reset_index() if view_type_in_index else df
+    if work.empty:
+        empty_cols = {}
+        for c in full_cols:
+            empty_cols[f"{c}_sum"] = pd.Series(dtype=pd.ArrowDtype(pa.float64()))
+            empty_cols[f"{c}_count"] = pd.Series(dtype=pd.ArrowDtype(pa.int64()))
+            empty_cols[f"{c}_sumsq"] = pd.Series(dtype=pd.ArrowDtype(pa.float64()))
+            empty_cols[f"{c}_min"] = pd.Series(dtype=pd.ArrowDtype(pa.float64()))
+            empty_cols[f"{c}_max"] = pd.Series(dtype=pd.ArrowDtype(pa.float64()))
+        for c in sum_cols:
+            empty_cols[f"{c}_sum"] = pd.Series(dtype=pd.ArrowDtype(pa.float64()))
+        for c in min_cols:
+            empty_cols[f"{c}_min"] = pd.Series(dtype=pd.ArrowDtype(pa.float64()))
+        for c in max_cols:
+            empty_cols[f"{c}_max"] = pd.Series(dtype=pd.ArrowDtype(pa.float64()))
+        for c, _ in set_cols_items:
+            empty_cols[f"{c}_unique"] = pd.Series(dtype="object")
+        out = pd.DataFrame(empty_cols)
+        out.index = pd.Index([], name=view_type)
+        return out
+
+    arrow_keep = [view_type]
+    for lst in (full_cols, sum_cols, min_cols, max_cols):
+        for c in lst:
+            if c in work.columns and c not in arrow_keep:
+                arrow_keep.append(c)
+    tbl = pa.Table.from_pandas(work[arrow_keep], preserve_index=False)
+
+    agg_specs = []
+    for c in full_cols:
+        if c not in tbl.schema.names:
+            continue
+        col_arr = pc.cast(tbl.column(c), pa.float64())
+        tbl = tbl.append_column(f"{c}__sq", pc.multiply(col_arr, col_arr))
+        agg_specs += [
+            (c, "sum"), (c, "count"), (c, "min"), (c, "max"),
+            (f"{c}__sq", "sum"),
+        ]
+    for c in sum_cols:
+        if c in tbl.schema.names:
+            agg_specs.append((c, "sum"))
+    for c in min_cols:
+        if c in tbl.schema.names:
+            agg_specs.append((c, "min"))
+    for c in max_cols:
+        if c in tbl.schema.names:
+            agg_specs.append((c, "max"))
+
+    if agg_specs:
+        result = tbl.group_by([view_type]).aggregate(agg_specs)
+        out = result.to_pandas(types_mapper=pd.ArrowDtype)
+        rename = {f"{c}__sq_sum": f"{c}_sumsq" for c in full_cols}
+        if rename:
+            out = out.rename(columns=rename)
+        out = out.set_index(view_type)
+    else:
+        uniq = work[view_type].drop_duplicates().reset_index(drop=True)
+        out = pd.DataFrame(index=pd.Index(uniq, name=view_type))
+
+    for col, agg in set_cols_items:
+        if col not in work.columns:
+            continue
+        sgb = work.groupby(view_type)[col]
+        chunk_fn = getattr(agg, "chunk", None)
+        partial = chunk_fn(sgb) if chunk_fn is not None else sgb.apply(S.flatten)
+        partial.name = f"{col}_unique"
+        out = out.join(partial, how="left")
+    return out
+
+
+def _finalize_view_partials(df, full_cols):
+    """Compute mean/std per view_type row from merged partials; drop helper cols."""
+    if df.empty:
+        return df
+    out = df.copy()
+    drop = []
+    for c in full_cols:
+        sum_c = f"{c}_sum"
+        count_c = f"{c}_count"
+        sq_c = f"{c}_sumsq"
+        if sum_c not in out.columns or count_c not in out.columns:
+            continue
+        s = out[sum_c].astype("float64")
+        n = out[count_c].astype("float64")
+        mean_v = s / n
+        out[f"{c}_mean"] = mean_v.astype(pd.ArrowDtype(pa.float64()))
+        if sq_c in out.columns:
+            sq = out[sq_c].astype("float64")
+            var_v = (sq - (s * s) / n) / (n - 1)
+            var_v = var_v.where(var_v >= 0, 0)
+            out[f"{c}_std"] = np.sqrt(var_v).astype(pd.ArrowDtype(pa.float64()))
+            drop.append(sq_c)
+        drop.append(count_c)
+    if drop:
+        out = out.drop(columns=drop)
+    return out
+
+
 def _worker_scan_to_ipc(files, index_path, time_granularity, time_resolution, query):
     """Dask worker task: scan aggregation and return Arrow IPC bytes per type.
 
@@ -1186,33 +1306,133 @@ class DFTracerAnalyzer(Analyzer):
                 )
         view_agg.update({col: [unique_set()] for col in local_view_types_diff})
 
-        std_cols = [c for c, a in view_agg.items() if "std" in a]
+        # Decompose view_agg into tree-reducible partials. Each input column's
+        # aggregation list is split into per-partition chunks that later merge
+        # via Dask's tree-reduce (sum/min/max/set-union are all associative).
+        full_cols, sum_cols, min_cols, max_cols = [], [], [], []
+        set_cols_items = []
+        for col, aggs in view_agg.items():
+            if col not in records.columns:
+                continue
+            if all(isinstance(a, str) for a in aggs):
+                s = set(aggs)
+                if s == {"sum", "min", "max", "mean", "std"}:
+                    full_cols.append(col)
+                elif s == {"sum"}:
+                    sum_cols.append(col)
+                elif s == {"min"}:
+                    min_cols.append(col)
+                elif s == {"max"}:
+                    max_cols.append(col)
+                else:
+                    raise ValueError(f"unsupported agg combo for {col}: {aggs}")
+            else:
+                set_cols_items.append((col, aggs[0]))
 
-        # Gather main_view to a pandas DataFrame once per layer, cache it across
-        # view_keys. Two-view layouts (proc_name, time_range) would otherwise
-        # pay the ~10s Dask->pandas gather twice.
-        cache = getattr(self, "_main_view_pdf_cache", None)
-        if cache is None:
-            cache = {}
-            self._main_view_pdf_cache = cache
-        cache_key = (layer, id(records))
-        if cache_key not in cache:
-            cache[cache_key] = records.map_partitions(
-                fix_std_cols, std_cols=std_cols
-            ).compute()
-        records_pdf = cache[cache_key]
-        pre_pdf = records_pdf.reset_index()
+        std_cols = list(full_cols)
+        records = records.map_partitions(fix_std_cols, std_cols=std_cols)
 
-        view_pdf = self._arrow_view_groupby(pre_pdf, view_type, view_agg)
-        view_pdf = view_pdf.replace(0, pd.NA)
-        view_pdf = view_pdf.rename(columns=build_view_rename_map(view_pdf.columns))
+        partial_meta = self._build_partial_meta(
+            records, view_type, full_cols, sum_cols, min_cols, max_cols, set_cols_items
+        )
+        partials = records.map_partitions(
+            _partial_arrow_view_groupby,
+            view_type,
+            full_cols,
+            sum_cols,
+            min_cols,
+            max_cols,
+            set_cols_items,
+            meta=partial_meta,
+        )
 
-        # Finalize eagerly in pandas
-        view_pdf = derive_call_stats(view_pdf)
-        view_pdf = set_unique_counts(view_pdf, layer=layer)
-        view_pdf = fix_dtypes(view_pdf, time_sliced=self.time_sliced)
+        merge_aggs = {}
+        for c in full_cols:
+            merge_aggs[f"{c}_sum"] = "sum"
+            merge_aggs[f"{c}_count"] = "sum"
+            merge_aggs[f"{c}_sumsq"] = "sum"
+            merge_aggs[f"{c}_min"] = "min"
+            merge_aggs[f"{c}_max"] = "max"
+        for c in sum_cols:
+            merge_aggs[f"{c}_sum"] = "sum"
+        for c in min_cols:
+            merge_aggs[f"{c}_min"] = "min"
+        for c in max_cols:
+            merge_aggs[f"{c}_max"] = "max"
+        for c, _ in set_cols_items:
+            merge_aggs[f"{c}_unique"] = unique_set_flatten()
 
-        return dd.from_pandas(view_pdf, npartitions=1).persist()
+        merged = partials.groupby(view_type).agg(merge_aggs)
+
+        final_meta = self._build_final_meta(merged, full_cols)
+        final = merged.map_partitions(
+            _finalize_view_partials, full_cols, meta=final_meta
+        )
+        final = final.rename(columns=build_view_rename_map(final.columns))
+        final = final.replace(0, pd.NA)
+        final = (
+            final.map_partitions(derive_call_stats)
+            .map_partitions(set_unique_counts, layer=layer)
+            .map_partitions(fix_dtypes, time_sliced=self.time_sliced)
+            .persist()
+        )
+        return final
+
+    @staticmethod
+    def _build_partial_meta(
+        records, view_type, full_cols, sum_cols, min_cols, max_cols, set_cols_items
+    ):
+        in_meta = records._meta
+        def _dtype_of(col, default=pd.ArrowDtype(pa.float64())):
+            if col in in_meta.columns:
+                return in_meta[col].dtype
+            if isinstance(in_meta.index, pd.MultiIndex) and col in in_meta.index.names:
+                return in_meta.index.get_level_values(col).dtype
+            return default
+
+        # Column order must exactly match what Arrow's group_by+aggregate
+        # emits. For full_cols agg_specs were appended as
+        # [(c, sum), (c, count), (c, min), (c, max), (c__sq, sum)] and
+        # c__sq_sum is renamed to c_sumsq after to_pandas.
+        cols = {}
+        for c in full_cols:
+            cols[f"{c}_sum"] = _dtype_of(c)
+            cols[f"{c}_count"] = pd.ArrowDtype(pa.int64())
+            cols[f"{c}_min"] = _dtype_of(c)
+            cols[f"{c}_max"] = _dtype_of(c)
+            cols[f"{c}_sumsq"] = pd.ArrowDtype(pa.float64())
+        for c in sum_cols:
+            cols[f"{c}_sum"] = _dtype_of(c)
+        for c in min_cols:
+            cols[f"{c}_min"] = _dtype_of(c)
+        for c in max_cols:
+            cols[f"{c}_max"] = _dtype_of(c)
+        for c, _ in set_cols_items:
+            cols[f"{c}_unique"] = "object"
+
+        meta = pd.DataFrame({name: pd.Series(dtype=dt) for name, dt in cols.items()})
+        idx_dtype = _dtype_of(view_type, default=pd.ArrowDtype(pa.int64()))
+        meta.index = pd.Index([], name=view_type, dtype=idx_dtype)
+        return meta
+
+    @staticmethod
+    def _build_final_meta(merged, full_cols):
+        # The merge step drops count/sumsq and adds mean/std per full_col.
+        cols = {}
+        for c in merged.columns:
+            if c.endswith("_count") and c[: -len("_count")] in full_cols:
+                continue
+            if c.endswith("_sumsq") and c[: -len("_sumsq")] in full_cols:
+                continue
+            cols[c] = merged._meta[c].dtype
+        for c in full_cols:
+            cols[f"{c}_mean"] = pd.ArrowDtype(pa.float64())
+            cols[f"{c}_std"] = pd.ArrowDtype(pa.float64())
+        meta = pd.DataFrame({name: pd.Series(dtype=dt) for name, dt in cols.items()})
+        meta.index = pd.Index(
+            [], name=merged._meta.index.name, dtype=merged._meta.index.dtype
+        )
+        return meta
 
     @staticmethod
     def _arrow_view_groupby(pdf: pd.DataFrame, view_type: str, view_agg: dict) -> pd.DataFrame:
