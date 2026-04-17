@@ -9,8 +9,10 @@ import os
 import pandas as pd
 import portion as I
 import structlog
-from dftracer.utils import Indexer, Reader
-from dask.distributed import wait
+import pyarrow as pa
+from dftracer.utils import Indexer, AggregationConfig
+from dftracer.utils.dask import DFTracerUtilsDaskWorkerPlugin, distributed_aggregate, distributed_aggregate_all
+from dask.distributed import Client, get_client, wait
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .analyzer import Analyzer
@@ -420,7 +422,49 @@ class DFTracerAnalyzer(Analyzer):
         super().__init__(preset, **kwargs)
         self.assign_epochs = assign_epochs
 
-    def read_trace(self, trace_path, extra_columns, extra_columns_fn):
+    @staticmethod
+    def _register_dask_plugin():
+        """Register the DFTracer Dask worker plugin if a distributed client is active.
+
+        Computes C++ Runtime threads as hardware_concurrency / n_workers_on_node
+        so the Runtime uses all available cores without oversubscription.
+        """
+        if DFTracerUtilsDaskWorkerPlugin is None:
+            return
+        try:
+            client = get_client()
+            scheduler_info = client.scheduler_info()
+            workers = scheduler_info.get("workers", {})
+
+            from collections import Counter
+
+            host_counts = Counter(w["host"] for w in workers.values())
+
+            class _AutoThreadPlugin(DFTracerUtilsDaskWorkerPlugin):
+                def __init__(self, host_worker_counts):
+                    super().__init__(threads=0)
+                    self._host_worker_counts = host_worker_counts
+
+                def setup(self, worker):
+                    total_cpus = (
+                        len(os.sched_getaffinity(0))
+                        if hasattr(os, "sched_getaffinity")
+                        else os.cpu_count() or 1
+                    )
+                    my_host = worker.address.split("://")[-1].rsplit(":", 1)[0]
+                    n_local = self._host_worker_counts.get(my_host, 1)
+                    self.threads = max(1, total_cpus // n_local)
+                    super().setup(worker)
+
+            client.register_plugin(_AutoThreadPlugin(dict(host_counts)))
+            logger.info(
+                "Registered DFTracerUtilsDaskWorkerPlugin",
+                host_worker_counts=dict(host_counts),
+            )
+        except (ValueError, ImportError):
+            pass
+
+    def old_read_trace(self, trace_path, extra_columns, extra_columns_fn):
         with log_block("glob_files"):
             pfw_pattern, pfw_gz_pattern = [], []
             if os.path.isdir(trace_path):
@@ -546,6 +590,230 @@ class DFTracerAnalyzer(Analyzer):
             exit(1)
         return ReadTraceResult(
             traces=self._rename_columns(traces),
+            profiles=profiles,
+            profile_time_granularity=self.profile_time_granularity if profiles is not None else None,
+            system_metrics=system_metrics,
+        )
+
+    def read_trace_local(self, trace_path, extra_columns=None, extra_columns_fn=None):
+        """Read trace using C++ aggregation pipeline.
+
+        This is a faster alternative to read_trace() that uses the C++ Indexer
+        with fused aggregation to produce pre-aggregated data directly.
+        All transformation (hash resolution, time normalization, io_cat, proc_name)
+        is done in C++ for performance.
+
+        Args:
+            trace_path: Directory containing trace files or glob pattern.
+            extra_columns: Not used (kept for API compatibility).
+            extra_columns_fn: Not used (kept for API compatibility).
+
+        Returns:
+            ReadTraceResult with traces, profiles, and system_metrics.
+        """
+        with log_block("cpp_indexer_setup"):
+            # Configure aggregation to match analyzer time granularity
+            time_interval_ms = self.time_granularity * 1000.0  # seconds to ms
+
+            # Build file list
+            files = []
+            directory = ""
+            if os.path.isdir(trace_path):
+                directory = trace_path
+            else:
+                # Glob pattern or single file
+                matched = glob.glob(trace_path) if "*" in trace_path else [trace_path]
+                files = [f for f in matched if f.endswith(".pfw") or f.endswith(".pfw.gz")]
+
+            if not directory and not files:
+                raise FileNotFoundError("No matching .pfw or .pfw.gz files found.")
+
+            indexer = Indexer(
+                directory=directory,
+                files=files if files else None,
+                require_checkpoint=True,
+                require_bloom=True,
+                require_manifest=True,
+                require_aggregation=AggregationConfig(
+                    time_interval_ms=time_interval_ms,
+                    compute_percentiles=False,
+                ),
+                force_rebuild=False,
+            )
+
+        with log_block("cpp_ensure_indexed"):
+            status = indexer.ensure_indexed()
+            logger.info(
+                "C++ indexing complete",
+                total_files=status.total_files,
+                ready=len(status.ready),
+                needs_work=len(status.needs_work),
+            )
+
+        with log_block("cpp_load_hash_tables"):
+            # Store hash tables for compatibility with other methods
+            file_hashes = indexer.get_hash_table("file")
+            host_hashes = indexer.get_hash_table("host")
+            self._file_hashes = pd.DataFrame(
+                {"name": list(file_hashes.values())},
+                index=pd.Index(list(file_hashes.keys()), name="hash", dtype="string"),
+            )
+            self._host_hashes = pd.DataFrame(
+                {"name": list(host_hashes.values())},
+                index=pd.Index(list(host_hashes.keys()), name="hash", dtype="string"),
+            )
+            self._string_hashes = pd.DataFrame(columns=["name"])
+            self._metadata = pd.DataFrame(columns=["name", "value"])
+
+        with log_block("cpp_iter_arrow_dfanalyzer"):
+            # Use fused C++ API that scans all types in one pass (~3x faster)
+            all_batches = indexer.iter_arrow_dfanalyzer_all(
+                time_granularity=self.time_granularity,
+                time_resolution=self.time_resolution,
+            )
+            event_batches = [pa.record_batch(b) for b in all_batches.get("events", [])]
+            profile_batches = [pa.record_batch(b) for b in all_batches.get("profiles", [])]
+            system_batches = [pa.record_batch(b) for b in all_batches.get("system", [])]
+
+        with log_block("cpp_to_dask"):
+            # Convert Arrow batches to Dask DataFrames
+            if event_batches:
+                events_table = pa.Table.from_batches(event_batches)
+                traces = dd.from_pandas(
+                    events_table.to_pandas(),
+                    npartitions=max(1, len(event_batches) // 10),
+                )
+            else:
+                traces = dd.from_pandas(
+                    pd.DataFrame(columns=list(PROFILE_OUTPUT_COLUMNS.keys())),
+                    npartitions=1,
+                )
+
+            if profile_batches:
+                profiles_table = pa.Table.from_batches(profile_batches)
+                profiles = dd.from_pandas(
+                    profiles_table.to_pandas(),
+                    npartitions=max(1, len(profile_batches) // 10),
+                )
+            else:
+                profiles = None
+
+            if system_batches:
+                system_table = pa.Table.from_batches(system_batches)
+                system_metrics = dd.from_pandas(
+                    system_table.to_pandas(),
+                    npartitions=max(1, len(system_batches) // 10),
+                )
+            else:
+                system_metrics = None
+
+        return ReadTraceResult(
+            traces=traces,
+            profiles=profiles,
+            profile_time_granularity=self.profile_time_granularity if profiles is not None else None,
+            system_metrics=system_metrics,
+        )
+
+    def read_trace(
+        self,
+        trace_path,
+        extra_columns=None,
+        extra_columns_fn=None,
+        client: Optional[Client] = None,
+    ):
+        """Read trace using C++ aggregation pipeline.
+
+        Uses the active Dask client for distributed execution across workers.
+        to parallelize aggregation across multiple nodes. Each worker aggregates
+        a subset of files, and results are merged on the coordinator.
+
+        Args:
+            trace_path: Directory containing trace files or glob pattern.
+            client: Dask distributed Client. If None, falls back to local execution.
+            extra_columns: Not used (kept for API compatibility).
+            extra_columns_fn: Not used (kept for API compatibility).
+
+        Returns:
+            ReadTraceResult with traces, profiles, and system_metrics.
+
+        Example:
+            >>> from dask.distributed import Client
+            >>> from dftracer.utils.dask import DFTracerUtilsDaskWorkerPlugin
+            >>>
+            >>> client = Client("scheduler:8786")
+            >>> client.register_plugin(DFTracerUtilsDaskWorkerPlugin(threads=48))
+            >>>
+            >>> analyzer = DFTracerAnalyzer(time_granularity=1.0)
+            >>> result = analyzer.read_trace_cpp_distributed("/traces", client=client)
+        """
+        with log_block("distributed_setup"):
+            time_interval_ms = self.time_granularity * 1000.0
+            self._register_dask_plugin()
+
+            # Build file list
+            files = None
+            directory = ""
+            if os.path.isdir(trace_path):
+                directory = trace_path
+            else:
+                matched = glob.glob(trace_path) if "*" in trace_path else [trace_path]
+                files = [f for f in matched if f.endswith(".pfw") or f.endswith(".pfw.gz")]
+
+            if not directory and not files:
+                raise FileNotFoundError("No matching .pfw or .pfw.gz files found.")
+
+        with log_block("distributed_aggregate_all"):
+            tables = distributed_aggregate_all(
+                directory=directory,
+                files=files,
+                client=client,
+                time_interval_ms=time_interval_ms,
+                time_granularity=self.time_granularity,
+                time_resolution=self.time_resolution,
+            )
+            events_table = tables["events"]
+            profiles_table = tables["profiles"]
+            system_table = tables["system"]
+
+        with log_block("distributed_to_dask"):
+            if events_table.num_rows > 0:
+                events_df = events_table.to_pandas()
+                for col in events_df.select_dtypes(include=["category"]).columns:
+                    events_df[col] = events_df[col].astype("string")
+                traces = dd.from_pandas(
+                    events_df,
+                    npartitions=max(1, events_table.num_rows // 100000),
+                )
+            else:
+                traces = dd.from_pandas(
+                    pd.DataFrame(columns=list(PROFILE_OUTPUT_COLUMNS.keys())),
+                    npartitions=1,
+                )
+
+            if profiles_table.num_rows > 0:
+                profiles = dd.from_pandas(
+                    profiles_table.to_pandas(),
+                    npartitions=max(1, profiles_table.num_rows // 100000),
+                )
+            else:
+                profiles = None
+
+            if system_table.num_rows > 0:
+                system_metrics = dd.from_pandas(
+                    system_table.to_pandas(),
+                    npartitions=max(1, system_table.num_rows // 100000),
+                )
+            else:
+                system_metrics = None
+
+        # Store empty hash tables for compatibility
+        self._file_hashes = pd.DataFrame(columns=["name"])
+        self._host_hashes = pd.DataFrame(columns=["name"])
+        self._string_hashes = pd.DataFrame(columns=["name"])
+        self._metadata = pd.DataFrame(columns=["name", "value"])
+
+        return ReadTraceResult(
+            traces=traces,
             profiles=profiles,
             profile_time_granularity=self.profile_time_granularity if profiles is not None else None,
             system_metrics=system_metrics,
