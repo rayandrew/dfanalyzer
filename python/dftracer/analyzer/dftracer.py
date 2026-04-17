@@ -184,13 +184,22 @@ SYSTEM_OUTPUT_COLUMNS = {
 }
 
 
-def _worker_hlm(ipc_result, data_type, hlm_groupby, hlm_agg):
-    """Compute partial HLM on a worker from IPC bytes using Arrow compute."""
+def _worker_hlm_partial(ipc_result, data_type, hlm_groupby, hlm_agg, bin_cols):
+    """Compute partial HLM on the worker that holds ``ipc_result``.
+
+    The full-granularity IPC already lives on the worker that produced it via
+    ``_worker_scan_to_ipc``; this task reuses those bytes in place, appends the
+    HLM-derived columns (time_sq, size_sq, call min/max), runs the groupby
+    via Arrow compute, then returns a small pandas DataFrame. Because each
+    worker's PIDs are disjoint and proc_name is always in hlm_groupby, the
+    per-worker partials carry disjoint keys; the caller can concatenate them
+    as Dask partitions without a cross-worker merge.
+    """
     import pyarrow.compute as pc
     import time as _time
 
     t0 = _time.time()
-    ipc_bytes = ipc_result[data_type]
+    ipc_bytes = ipc_result[data_type] if isinstance(ipc_result, dict) else None
     if ipc_bytes is None:
         return pd.DataFrame()
     reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
@@ -216,28 +225,42 @@ def _worker_hlm(ipc_result, data_type, hlm_groupby, hlm_agg):
     if not available_groupby:
         return pd.DataFrame()
 
-    agg_map = {"sum": "sum", "min": "min", "max": "max"}
     agg_specs = []
     for col, agg_fn in hlm_agg.items():
-        if col in table.column_names and agg_fn in agg_map:
-            agg_specs.append((col, agg_map[agg_fn]))
+        if col in table.column_names and agg_fn in ("sum", "min", "max"):
+            agg_specs.append((col, agg_fn))
 
     t1 = _time.time()
     result = table.group_by(available_groupby).aggregate(agg_specs)
     t2 = _time.time()
 
-    rename = {}
-    for col, agg_fn in agg_specs:
-        rename[f"{col}_{agg_fn}"] = col
+    rename = {f"{col}_{agg_fn}": col for col, agg_fn in agg_specs}
+    result = result.rename_columns([rename.get(c, c) for c in result.column_names])
+    pdf = result.to_pandas()
 
-    out = result.rename_columns(
-        [rename.get(c, c) for c in result.column_names]
-    ).to_pandas()
+    if "cat" in pdf.columns:
+        pdf["cat"] = pdf["cat"].astype("object").str.lower()
+    for col in pdf.select_dtypes(include=["string"]).columns:
+        pdf[col] = pdf[col].astype("object")
+    for col in pdf.select_dtypes(include=["int64", "uint64"]).columns:
+        pdf[col] = pdf[col].astype("Int64")
+    for col in pdf.select_dtypes(include=["float64"]).columns:
+        pdf[col] = pdf[col].astype("Float64")
+    pdf = pdf.replace(0, pd.NA)
+    for col in bin_cols:
+        if col in pdf.columns:
+            pdf[col] = pdf[col].astype("Int32")
+    # Downstream (_compute_view, _reconcile_hlm) expects HLM indexed by
+    # hlm_groupby; matches the single-partition full-path contract.
+    pdf = pdf.set_index(available_groupby).sort_index()
     t3 = _time.time()
-    print(f"[_worker_hlm] type={data_type} rows={table.num_rows} "
-          f"decode={t1-t0:.2f}s groupby={t2-t1:.2f}s to_pandas={t3-t2:.2f}s "
-          f"result_rows={len(out)} total={t3-t0:.2f}s", flush=True)
-    return out
+    print(
+        f"[_worker_hlm_partial] type={data_type} in_rows={table.num_rows} "
+        f"decode={t1-t0:.2f}s groupby={t2-t1:.2f}s finalize={t3-t2:.2f}s "
+        f"out_rows={len(pdf)} total={t3-t0:.2f}s",
+        flush=True,
+    )
+    return pdf
 
 
 def _ipc_to_pandas(ipc_bytes):
@@ -282,6 +305,8 @@ def _worker_scan_to_ipc(files, index_path, time_granularity, time_resolution, qu
         else:
             result[data_type] = None
     return result
+
+
 
 
 def create_index(filename):
@@ -907,6 +932,7 @@ class DFTracerAnalyzer(Analyzer):
             worker_list = list(dask_client.scheduler_info().get("workers", {}).keys())
 
             event_futures = []
+            worker_scan_args = []
             for worker_id, fids in worker_file_ids.items():
                 wfiles = [file_id_to_path[fid] for fid in fids if fid in file_id_to_path]
                 if not wfiles:
@@ -931,8 +957,11 @@ class DFTracerAnalyzer(Analyzer):
                     pure=False,
                 )
                 event_futures.append(future)
+                worker_scan_args.append((worker_addr, wfiles, query))
 
             self._worker_ipc_futures = event_futures
+            self._worker_scan_args = worker_scan_args
+            self._index_path = index_path
             self._dask_client = dask_client
 
         with log_block("build_dask_dataframe"):
@@ -1023,70 +1052,70 @@ class DFTracerAnalyzer(Analyzer):
         hlm_agg["size_call_min"] = "min"
         hlm_agg["size_call_max"] = "max"
 
-        import pyarrow.compute as pc
+        # Pin each partial-HLM task to the worker that already holds the IPC
+        # bytes, so the ~1.7M-row payload stays put instead of being shipped.
+        worker_addrs = [a for (a, _, _) in getattr(self, "_worker_scan_args", [])]
+        if len(worker_addrs) < len(self._worker_ipc_futures):
+            worker_addrs += [None] * (len(self._worker_ipc_futures) - len(worker_addrs))
 
-        ipc_results = self._dask_client.gather(self._worker_ipc_futures)
-        tables = []
-        for r in ipc_results:
-            ipc_bytes = r[data_type]
-            if ipc_bytes is None:
+        partial_futures = []
+        for addr, ipc_future in zip(worker_addrs, self._worker_ipc_futures):
+            fut = self._dask_client.submit(
+                _worker_hlm_partial,
+                ipc_future,
+                data_type,
+                list(hlm_groupby),
+                dict(hlm_agg),
+                list(bin_cols),
+                workers=[addr] if addr else None,
+                pure=False,
+            )
+            partial_futures.append(fut)
+
+        # Wrap each worker's partial as a Dask partition. Partitions stay on
+        # their worker; persist() doesn't ship a big pandas through the graph.
+        partial_delayed = [dask.delayed(f) for f in partial_futures]
+        meta = self._build_hlm_meta(hlm_groupby, hlm_agg, bin_cols)
+        ddf = dd.from_delayed(partial_delayed, meta=meta)
+        return ddf
+
+    @staticmethod
+    def _build_hlm_meta(hlm_groupby, hlm_agg, bin_cols):
+        """Meta for the Dask DataFrame assembled from _worker_hlm_partial.
+
+        Must mirror the partition shape: hlm_groupby as a MultiIndex and the
+        remaining aggregated columns as regular columns. bin_cols live on the
+        ``traces`` DataFrame (added post-read via set_size_bins) and are not
+        present in the worker IPC; they are deliberately excluded from the
+        HLM meta, matching the prior full-path behavior where
+        ``if col in combined.column_names`` silently dropped them.
+        """
+        int_groupby = {"pid", "tid", "io_cat", "acc_pat", "time_range"}
+        time_metric_cols = {
+            "time", "time_sq", "time_min", "time_max",
+            "time_call_min", "time_call_max", "time_start", "time_end",
+        }
+        bin_set = set(bin_cols)
+
+        data_cols = {}
+        for col in hlm_agg:
+            if col in hlm_groupby or col in bin_set:
                 continue
-            reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
-            table = reader.read_all()
-            if table.num_rows == 0:
-                continue
-            for i, field in enumerate(table.schema):
-                if pa.types.is_dictionary(field.type):
-                    table = table.set_column(i, field.name, table.column(i).cast(pa.string()))
-            tables.append(table)
+            if col in time_metric_cols:
+                data_cols[col] = pd.Series(dtype="Float64")
+            else:
+                data_cols[col] = pd.Series(dtype="Int64")
 
-        if not tables:
-            return None
-
-        combined = pa.concat_tables(tables)
-
-        time_col = combined.column("time")
-        size_col = combined.column("size")
-        combined = combined.append_column("time_sq", pc.multiply(time_col, time_col))
-        size_filled = pc.if_else(pc.is_null(size_col), pa.scalar(0, pa.int64()), size_col)
-        combined = combined.append_column("size_sq", pc.multiply(size_filled, size_filled))
-        combined = combined.append_column("time_call_min", time_col)
-        combined = combined.append_column("time_call_max", time_col)
-        combined = combined.append_column("size_call_min", size_col)
-        combined = combined.append_column("size_call_max", size_col)
-
-        available_groupby = [c for c in hlm_groupby if c in combined.column_names]
-        if not available_groupby:
-            return dd.from_pandas(pd.DataFrame(), npartitions=1)
-
-        agg_specs = []
-        for col, agg_fn in hlm_agg.items():
-            if col in combined.column_names and agg_fn in ("sum", "min", "max"):
-                agg_specs.append((col, agg_fn))
-
-        merged = combined.group_by(available_groupby).aggregate(agg_specs)
-
-        rename = {}
-        for col, agg_fn in agg_specs:
-            rename[f"{col}_{agg_fn}"] = col
-        merged = merged.rename_columns([rename.get(c, c) for c in merged.column_names])
-
-        hlm = merged.to_pandas()
-        if "cat" in hlm.columns:
-            hlm["cat"] = hlm["cat"].str.lower()
-        for col in hlm.select_dtypes(include=["string"]).columns:
-            hlm[col] = hlm[col].astype("object")
-        for col in hlm.select_dtypes(include=["int64", "uint64"]).columns:
-            hlm[col] = hlm[col].astype("Int64")
-        for col in hlm.select_dtypes(include=["float64"]).columns:
-            hlm[col] = hlm[col].astype("Float64")
-        hlm = hlm.replace(0, pd.NA)
-        for col in bin_cols:
-            if col in hlm.columns:
-                hlm[col] = hlm[col].astype("Int32")
-        available_groupby = [c for c in hlm_groupby if c in hlm.columns]
-        hlm = hlm.set_index(available_groupby).sort_index()
-        return dd.from_delayed([dask.delayed(lambda x: x)(hlm)], meta=hlm.iloc[:0])
+        meta = pd.DataFrame(data_cols)
+        idx_arrays = []
+        for col in hlm_groupby:
+            if col in int_groupby:
+                idx_arrays.append(pd.array([], dtype="Int64"))
+            else:
+                idx_arrays.append(pd.array([], dtype="object"))
+        if idx_arrays:
+            meta.index = pd.MultiIndex.from_arrays(idx_arrays, names=list(hlm_groupby))
+        return meta
 
     def _compute_high_level_metrics(self, traces, view_types, partition_size):
         result = self._distributed_hlm("events", view_types, traces)
