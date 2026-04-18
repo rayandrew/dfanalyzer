@@ -193,6 +193,34 @@ SYSTEM_OUTPUT_COLUMNS = {
 }
 
 
+def _make_empty_hlm(hlm_groupby, hlm_agg, bin_cols):
+    """Return an empty DataFrame matching the HLM meta schema."""
+    int_groupby = {"pid", "tid", "io_cat", "acc_pat", "time_range"}
+    time_metric_cols = {
+        "time", "time_sq", "time_min", "time_max",
+        "time_call_min", "time_call_max", "time_start", "time_end",
+    }
+    bin_set = set(bin_cols)
+    data_cols = {}
+    for col in hlm_agg:
+        if col in hlm_groupby or col in bin_set:
+            continue
+        if col in time_metric_cols:
+            data_cols[col] = pd.Series(dtype=pd.ArrowDtype(pa.float64()))
+        else:
+            data_cols[col] = pd.Series(dtype=pd.ArrowDtype(pa.int64()))
+    meta = pd.DataFrame(data_cols)
+    idx_arrays = []
+    for col in hlm_groupby:
+        if col in int_groupby:
+            idx_arrays.append(pd.array([], dtype=pd.ArrowDtype(pa.int64())))
+        else:
+            idx_arrays.append(pd.array([], dtype=pd.ArrowDtype(pa.string())))
+    if idx_arrays:
+        meta.index = pd.MultiIndex.from_arrays(idx_arrays, names=list(hlm_groupby))
+    return meta
+
+
 def _worker_hlm_partial(ipc_result, data_type, hlm_groupby, hlm_agg, bin_cols):
     """Per-worker partial HLM from already-resident IPC bytes.
 
@@ -201,14 +229,16 @@ def _worker_hlm_partial(ipc_result, data_type, hlm_groupby, hlm_agg, bin_cols):
     """
     import time as _time
 
+    empty = lambda: _make_empty_hlm(hlm_groupby, hlm_agg, bin_cols)
+
     t0 = _time.time()
     ipc_bytes = ipc_result[data_type] if isinstance(ipc_result, dict) else None
     if ipc_bytes is None:
-        return pd.DataFrame()
+        return empty()
     reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
     table = reader.read_all()
     if table.num_rows == 0:
-        return pd.DataFrame()
+        return empty()
 
     for i, field in enumerate(table.schema):
         if pa.types.is_dictionary(field.type):
@@ -226,7 +256,7 @@ def _worker_hlm_partial(ipc_result, data_type, hlm_groupby, hlm_agg, bin_cols):
 
     available_groupby = [c for c in hlm_groupby if c in table.column_names]
     if not available_groupby:
-        return pd.DataFrame()
+        return empty()
 
     agg_specs = []
     for col, agg_fn in hlm_agg.items():
@@ -1043,9 +1073,8 @@ class DFTracerAnalyzer(Analyzer):
                 )
 
         with log_block("distribute_scan"):
-            all_files = status.ready + status.needs_work
-            file_pids = indexer.query_all_file_pids()
-            index_path = status.index_path
+            file_id_to_path, file_pids = indexer.query_file_info()
+            index_path = os.path.abspath(status.index_path)
             indexer.close()
 
             try:
@@ -1057,9 +1086,9 @@ class DFTracerAnalyzer(Analyzer):
                 return self.read_trace_local(trace_path)
 
             n_workers = len(dask_client.scheduler_info().get("workers", {})) or 1
-            worker_file_ids = _assign_files_by_pid(file_pids, n_workers)
-
-            file_id_to_path = {i: path for i, path in enumerate(all_files)}
+            all_file_ids = set(file_id_to_path.keys())
+            full_file_pids = {fid: file_pids.get(fid, set()) for fid in all_file_ids}
+            worker_file_ids = _assign_files_by_pid(full_file_pids, n_workers)
             worker_list = list(dask_client.scheduler_info().get("workers", {}).keys())
 
             event_futures = []
@@ -1120,14 +1149,14 @@ class DFTracerAnalyzer(Analyzer):
                 COL_TIME_END: pd.Series(dtype="int64"),
             })
 
-            def _extract_and_decode(ipc_future, key):
+            def _extract_and_decode(ipc_future, key, meta):
                 ipc_bytes = ipc_future[key]
                 if ipc_bytes is None:
-                    return pd.DataFrame()
+                    return meta.iloc[:0].copy()
                 return _ipc_to_pandas(ipc_bytes)
 
             event_delayed = [
-                dask.delayed(_extract_and_decode)(dask.delayed(f), "events")
+                dask.delayed(_extract_and_decode)(dask.delayed(f), "events", events_meta)
                 for f in event_futures
             ]
             traces = (
@@ -1147,7 +1176,7 @@ class DFTracerAnalyzer(Analyzer):
 
             if has_profiles:
                 profile_delayed = [
-                    dask.delayed(_extract_and_decode)(dask.delayed(f), "profiles")
+                    dask.delayed(_extract_and_decode)(dask.delayed(f), "profiles", events_meta)
                     for f in event_futures
                 ]
                 profiles = dd.from_delayed(profile_delayed, meta=events_meta)
@@ -1210,38 +1239,8 @@ class DFTracerAnalyzer(Analyzer):
 
     @staticmethod
     def _build_hlm_meta(hlm_groupby, hlm_agg, bin_cols):
-        """Meta for the Dask DataFrame from _worker_hlm_partial.
-
-        hlm_groupby becomes a MultiIndex; aggregated metrics are columns.
-        bin_cols live on ``traces`` (added by set_size_bins), not in worker
-        IPC, so they are excluded here.
-        """
-        int_groupby = {"pid", "tid", "io_cat", "acc_pat", "time_range"}
-        time_metric_cols = {
-            "time", "time_sq", "time_min", "time_max",
-            "time_call_min", "time_call_max", "time_start", "time_end",
-        }
-        bin_set = set(bin_cols)
-
-        data_cols = {}
-        for col in hlm_agg:
-            if col in hlm_groupby or col in bin_set:
-                continue
-            if col in time_metric_cols:
-                data_cols[col] = pd.Series(dtype=pd.ArrowDtype(pa.float64()))
-            else:
-                data_cols[col] = pd.Series(dtype=pd.ArrowDtype(pa.int64()))
-
-        meta = pd.DataFrame(data_cols)
-        idx_arrays = []
-        for col in hlm_groupby:
-            if col in int_groupby:
-                idx_arrays.append(pd.array([], dtype=pd.ArrowDtype(pa.int64())))
-            else:
-                idx_arrays.append(pd.array([], dtype=pd.ArrowDtype(pa.string())))
-        if idx_arrays:
-            meta.index = pd.MultiIndex.from_arrays(idx_arrays, names=list(hlm_groupby))
-        return meta
+        """Meta for the Dask DataFrame from _worker_hlm_partial."""
+        return _make_empty_hlm(hlm_groupby, hlm_agg, bin_cols)
 
     def _compute_high_level_metrics(self, traces, view_types, partition_size):
         result = self._distributed_hlm("events", view_types, traces)
