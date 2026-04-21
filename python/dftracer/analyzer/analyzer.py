@@ -91,6 +91,7 @@ class Analyzer(abc.ABC):
         time_granularity: float = 1,
         time_resolution: float = 1e6,
         time_sliced: bool = False,
+        trace_groups: Optional[List[str]] = None,
         verbose: bool = False,
     ):
         """Initializes the Analyzer instance.
@@ -130,6 +131,7 @@ class Analyzer(abc.ABC):
         self.time_granularity = time_granularity
         self.time_resolution = time_resolution
         self.time_sliced = time_sliced
+        self.trace_groups = list(trace_groups) if trace_groups else None
         self.verbose = verbose
         ensure_dir(self.checkpoint_dir)
 

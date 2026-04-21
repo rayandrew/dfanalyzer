@@ -708,6 +708,53 @@ def load_objects_str(
     return {}
 
 
+def _resolve_trace_inputs(
+    trace_path: str,
+    trace_groups: Optional[List[str]],
+) -> Tuple[str, Optional[List[str]]]:
+    """Resolve a trace path into (directory, files) for the Indexer.
+
+    If trace_path is a directory containing manifest.json (dftracer_organize
+    output) AND trace_groups is set, glob only the subdirs for the requested
+    groups. Otherwise, preserve the legacy behavior (directory, or glob list).
+    """
+    if not os.path.isdir(trace_path):
+        matched = glob.glob(trace_path) if "*" in trace_path else [trace_path]
+        files = [f for f in matched if f.endswith(".pfw") or f.endswith(".pfw.gz")]
+        return "", files
+
+    manifest_path = os.path.join(trace_path, "manifest.json")
+    has_manifest = os.path.isfile(manifest_path)
+
+    if not has_manifest:
+        if trace_groups:
+            raise FileNotFoundError(
+                f"trace_groups={trace_groups} requested but no manifest.json at "
+                f"{manifest_path}. Run dftracer_organize to produce it, or unset "
+                "trace_groups."
+            )
+        return trace_path, None
+
+    with open(manifest_path, "r") as f:
+        manifest = json.load(f)
+    group_map = manifest.get("groups") or {}
+
+    selected = trace_groups if trace_groups else sorted(group_map.keys())
+    missing = [g for g in selected if g not in group_map]
+    if missing:
+        raise KeyError(
+            f"trace_groups {missing} not found in manifest at {manifest_path}; "
+            f"available groups: {sorted(group_map.keys())}"
+        )
+
+    files: List[str] = []
+    for g in selected:
+        subdir = os.path.join(trace_path, group_map[g])
+        files.extend(glob.glob(os.path.join(subdir, "*.pfw.gz")))
+        files.extend(glob.glob(os.path.join(subdir, "*.pfw")))
+    return "", files
+
+
 class DFTracerAnalyzer(Analyzer):
     def __init__(self, preset, assign_epochs=False, **kwargs):
         super().__init__(preset, **kwargs)
@@ -906,15 +953,7 @@ class DFTracerAnalyzer(Analyzer):
             # Configure aggregation to match analyzer time granularity
             time_interval_ms = self.time_granularity * 1000.0  # seconds to ms
 
-            # Build file list
-            files = []
-            directory = ""
-            if os.path.isdir(trace_path):
-                directory = trace_path
-            else:
-                # Glob pattern or single file
-                matched = glob.glob(trace_path) if "*" in trace_path else [trace_path]
-                files = [f for f in matched if f.endswith(".pfw") or f.endswith(".pfw.gz")]
+            directory, files = _resolve_trace_inputs(trace_path, self.trace_groups)
 
             if not directory and not files:
                 raise FileNotFoundError("No matching .pfw or .pfw.gz files found.")
@@ -1031,13 +1070,7 @@ class DFTracerAnalyzer(Analyzer):
             time_interval_ms = self.time_granularity * 1000.0
             self._register_dask_plugin()
 
-            files = None
-            directory = ""
-            if os.path.isdir(trace_path):
-                directory = trace_path
-            else:
-                matched = glob.glob(trace_path) if "*" in trace_path else [trace_path]
-                files = [f for f in matched if f.endswith(".pfw") or f.endswith(".pfw.gz")]
+            directory, files = _resolve_trace_inputs(trace_path, self.trace_groups)
 
             if not directory and not files:
                 raise FileNotFoundError("No matching .pfw or .pfw.gz files found.")

@@ -276,6 +276,104 @@ class AnalyzerPresetConfigDLIOAILogging(AnalyzerPresetConfigDLIO):
 
 
 @dc.dataclass
+class AnalyzerPresetConfigAPP(AnalyzerPresetConfig):
+    """Minimal APP-layer preset: counts/durations for cat=="app" events only.
+
+    Mirror of POSIX preset for the compute/APP group. Used to demonstrate the
+    group-selective loading benefit of dftracer_organize: pairs with
+    trace_groups=[compute] so the loader skips the io group entirely.
+    """
+    derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
+        default_factory=lambda: {'app': {}}
+    )
+    layer_defs: Dict[str, Optional[str]] = dc.field(
+        default_factory=lambda: {
+            'app': 'cat == "app"',
+        }
+    )
+    logical_views: Optional[Dict[str, Dict[str, Optional[str]]]] = dc.field(
+        default_factory=lambda: {
+            'proc_name': {
+                'host_name': 'proc_name.str.split("#").str[1]',
+                'proc_id': 'proc_name.str.split("#").str[2]',
+                'thread_id': 'proc_name.str.split("#").str[3]',
+            },
+        }
+    )
+    name: str = "app"
+
+
+@dc.dataclass
+class AnalyzerPresetConfigDLIOAppOnly(AnalyzerPresetConfigDLIOAILogging):
+    """DLIO AI-logging preset stripped of POSIX/STDIO layers.
+
+    Exercises only app/training/epoch/compute-style events. Used to demonstrate
+    the group-selective loading benefit of dftracer_organize: pairs with
+    trace_groups=[compute] so the loader skips the io group entirely.
+    """
+    async_layers: Optional[List[str]] = dc.field(
+        default_factory=lambda: ['data_loader', 'reader']
+    )
+    derived_metrics: Optional[Dict[str, Dict[str, str]]] = dc.field(
+        default_factory=lambda: {
+            'app': {},
+            'training': {},
+            'epoch': {},
+            'compute': {},
+            'fetch_data': {},
+            'checkpoint': {},
+            'comm': {},
+            'device': {},
+            'data_loader': {
+                'init': 'func_name.str.contains("init")',
+                'item': 'func_name.str.contains("item")',
+            },
+            'reader': {
+                'close': 'func_name.str.contains(".close")',
+                'open': 'func_name.str.contains(".open")',
+                'preprocess': 'func_name.str.contains(".preprocess")',
+                'sample': 'func_name.str.contains(".get_sample")',
+            },
+        }
+    )
+    layer_defs: Dict[str, Optional[str]] = dc.field(
+        default_factory=lambda: {
+            # DLIO-style 'app' (ai_root) + generic APP-category fallback so the
+            # preset also fires on traces that just tag events with cat=="app".
+            'app': 'func_name == "ai_root" or cat == "app"',
+            'training': 'cat == "pipeline" & func_name == "train"',
+            'epoch': 'cat == "pipeline" & func_name.str.startswith("epoch")',
+            'compute': 'cat == "compute"',
+            'fetch_data': 'func_name == "fetch.iter"',
+            'checkpoint': 'cat == "checkpoint"',
+            'comm': 'cat == "comm"',
+            'device': 'cat == "device"',
+            'data_loader': 'cat.isin(["data", "data_loader", "dataloader"])',
+            'reader': 'cat == "reader" or func_name == "preprocess"',
+        }
+    )
+    layer_deps: Optional[Dict[str, Optional[str]]] = dc.field(
+        default_factory=lambda: {
+            'app': None,
+            'training': 'app',
+            'epoch': 'training',
+            'compute': 'epoch',
+            'fetch_data': 'epoch',
+            'checkpoint': 'epoch',
+            'comm': 'epoch',
+            'device': 'epoch',
+            'data_loader': 'fetch_data',
+            'reader': 'data_loader',
+        }
+    )
+    size_derived_metrics: Optional[Dict[str, List[str]]] = dc.field(
+        default_factory=dict
+    )
+    size_layers: Optional[List[str]] = dc.field(default_factory=list)
+    name: str = "dlio-app"
+
+
+@dc.dataclass
 class AnalyzerConfig:
     checkpoint: Optional[bool] = True
     checkpoint_dir: Optional[str] = "${hydra:run.dir}/checkpoints"
@@ -287,6 +385,9 @@ class AnalyzerConfig:
     time_granularity: Optional[float] = MISSING
     time_resolution: Optional[float] = MISSING
     time_sliced: Optional[bool] = False
+    # When trace_path points at a dftracer_organize output dir (has manifest.json),
+    # restrict loading to these groups. None or empty means "read everything".
+    trace_groups: Optional[List[str]] = None
 
 
 @dc.dataclass
@@ -473,6 +574,8 @@ def init_hydra_config_store() -> ConfigStore:
     cs.store(group="analyzer/preset", name="posix", node=AnalyzerPresetConfigPOSIX)
     cs.store(group="analyzer/preset", name="dlio-prev", node=AnalyzerPresetConfigDLIO)
     cs.store(group="analyzer/preset", name="dlio", node=AnalyzerPresetConfigDLIOAILogging)
+    cs.store(group="analyzer/preset", name="dlio-app", node=AnalyzerPresetConfigDLIOAppOnly)
+    cs.store(group="analyzer/preset", name="app", node=AnalyzerPresetConfigAPP)
     cs.store(group="cluster", name="external", node=ExternalClusterConfig)
     cs.store(group="cluster", name="local", node=LocalClusterConfig)
     cs.store(group="cluster", name="lsf", node=LSFClusterConfig)
