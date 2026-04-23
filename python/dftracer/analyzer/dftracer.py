@@ -865,9 +865,17 @@ class DFTracerAnalyzer(Analyzer):
         if DFTracerUtilsDaskWorkerPlugin is None:
             return
         try:
+            import time as _time
+
             client = get_client()
-            scheduler_info = client.scheduler_info()
-            workers = scheduler_info.get("workers", {})
+            target = len(client.nthreads())
+            workers: Dict[str, Dict] = {}
+            for _ in range(30):
+                scheduler_info = client.scheduler_info()
+                workers = scheduler_info.get("workers", {})
+                if len(workers) >= target:
+                    break
+                _time.sleep(0.5)
 
             from collections import Counter
 
@@ -887,12 +895,19 @@ class DFTracerAnalyzer(Analyzer):
                     my_host = worker.address.split("://")[-1].rsplit(":", 1)[0]
                     n_local = self._host_worker_counts.get(my_host, 1)
                     self.threads = max(1, total_cpus // n_local)
+                    import logging as _logging
+                    _logging.getLogger("distributed.worker").info(
+                        "DFTracer Runtime: host=%s cpus=%d workers_on_host=%d "
+                        "cpp_threads=%d",
+                        my_host, total_cpus, n_local, self.threads,
+                    )
                     super().setup(worker)
 
             client.register_plugin(_AutoThreadPlugin(dict(host_counts)))
             logger.info(
                 "Registered DFTracerUtilsDaskWorkerPlugin",
                 host_worker_counts=dict(host_counts),
+                total_workers=sum(host_counts.values()),
             )
         except (ValueError, ImportError):
             pass
@@ -1215,11 +1230,12 @@ class DFTracerAnalyzer(Analyzer):
             if dask_client is None:
                 return self.read_trace_local(trace_path)
 
-            n_workers = len(dask_client.scheduler_info().get("workers", {})) or 1
+            worker_nthreads = dask_client.nthreads()
+            n_workers = len(worker_nthreads) or 1
             all_file_ids = set(file_id_to_path.keys())
             full_file_pids = {fid: file_pids.get(fid, set()) for fid in all_file_ids}
             worker_file_ids = _assign_files_by_pid(full_file_pids, n_workers)
-            worker_list = list(dask_client.scheduler_info().get("workers", {}).keys())
+            worker_list = list(worker_nthreads.keys())
 
             event_futures = []
             worker_scan_args = []
