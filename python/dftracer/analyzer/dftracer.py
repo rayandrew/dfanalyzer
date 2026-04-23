@@ -1056,6 +1056,7 @@ class DFTracerAnalyzer(Analyzer):
             indexer = Indexer(
                 directory=directory,
                 files=files if files else None,
+                index_dir=self.index_dir,
                 require_checkpoint=True,
                 require_bloom=True,
                 require_manifest=True,
@@ -1174,6 +1175,7 @@ class DFTracerAnalyzer(Analyzer):
             indexer = Indexer(
                 directory=directory,
                 files=files,
+                index_dir=self.index_dir,
                 require_checkpoint=True,
                 require_bloom=True,
                 require_manifest=True,

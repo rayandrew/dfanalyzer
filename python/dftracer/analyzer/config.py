@@ -377,6 +377,7 @@ class AnalyzerPresetConfigDLIOAppOnly(AnalyzerPresetConfigDLIOAILogging):
 class AnalyzerConfig:
     checkpoint: Optional[bool] = True
     checkpoint_dir: Optional[str] = "${hydra:run.dir}/checkpoints"
+    index_dir: Optional[str] = ""
     profile_distribution: Optional[str] = "uniform"
     profile_time_granularity: Optional[float] = 5
     preset: Optional[AnalyzerPresetConfig] = MISSING

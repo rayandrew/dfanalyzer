@@ -84,6 +84,7 @@ class Analyzer(abc.ABC):
         checkpoint: bool = True,
         checkpoint_dir: str = "",
         debug: bool = False,
+        index_dir: str = "",
         profile_distribution: str = "uniform",
         profile_time_granularity: float = 5,
         quantile_stats: bool = False,
@@ -121,6 +122,7 @@ class Analyzer(abc.ABC):
         self.checkpoint_tasks = []
         self.dask_client = get_client()
         self.debug = debug
+        self.index_dir = index_dir
         self.profile_distribution = profile_distribution
         self.profile_time_granularity = profile_time_granularity
         self.quantile_stats = quantile_stats
