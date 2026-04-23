@@ -17,6 +17,7 @@ from dftracer.utils.dask import (
     _assign_files_by_pid,
     distributed_aggregate,
     distributed_aggregate_all,
+    distributed_index as _distributed_index,
 )
 from dask.distributed import Client, get_client, wait
 from typing import Callable, Dict, List, Optional, Tuple
@@ -759,6 +760,100 @@ class DFTracerAnalyzer(Analyzer):
     def __init__(self, preset, assign_epochs=False, **kwargs):
         super().__init__(preset, **kwargs)
         self.assign_epochs = assign_epochs
+
+    @staticmethod
+    def build_index_distributed(
+        directory: str = "",
+        files: Optional[List[str]] = None,
+        index_path: str = "",
+        local_staging: str = "",
+        lustre_staging: str = "",
+        client: Optional["Client"] = None,
+        checkpoint_size: int = 32 * 1024 * 1024,
+        bloom_dimensions: Optional[List[str]] = None,
+        build_manifest: bool = True,
+        force_rebuild: bool = False,
+        partition: str = "lpt",
+        rebuild_root_summaries: bool = True,
+        parallelism_per_worker: int = 0,
+        flush_every_files: int = 0,
+        aggregation: Optional["AggregationConfig"] = None,
+        auto_register_plugin: bool = True,
+    ) -> dict:
+        """Build the dftracer index across a Dask cluster.
+
+        DFTracer-specific: the whole SST-based pipeline assumes .pfw/.pfw.gz
+        inputs. Other analyzers (Darshan, Recorder) use their own tooling.
+
+        Steps:
+            1. Parallel directory scan + LPT bin-pack files across workers.
+            2. Coordinator pre-registers files and assigns file_id ranges.
+            3. Each Dask worker builds per-CF SSTs under `local_staging`,
+               then moves them to `lustre_staging` for coordinator ingest.
+            4. If `aggregation` is given, each worker also attaches an
+               SST-backed AggregationVisitor per file. Per-file aggregation
+               SSTs (mixed Put+Merge operands) are produced bounded by
+               AggregationVisitor::FLUSH_THRESHOLD. Cross-worker overlapping
+               `(pid, time_bucket, ...)` keys are combined by the rocksdb
+               merge_operator at read/compaction time.
+            5. Coordinator runs bulk_ingest (one-at-a-time for content-
+               addressed CFs + AGGREGATION + SYSTEM_METRICS) and
+               rebuild_root_summaries.
+
+        After this returns, `DFTracerAnalyzer.read_trace()` will find the
+        index already built (including aggregation when requested) and
+        skip the serial ensure_indexed phase entirely.
+
+        Args:
+            directory: Trace directory to scan. Mutually exclusive with
+                `files`.
+            files: Explicit file list.
+            index_path: Target .dftindex on shared FS.
+            local_staging: Per-worker SST build dir (prefer node-local,
+                e.g. /l/ssd/dftracer_sst). Required.
+            lustre_staging: Shared-FS dir the coordinator reads SSTs from.
+                Defaults to local_staging when unset (single-FS mode).
+            client: Dask Client. If None, a cluster-local Client is looked
+                up; if that fails too, tasks run inline serially.
+            auto_register_plugin: If True, install the DFTracer worker
+                plugin so per-worker C++ Runtime threads match
+                hw_concurrency / n_workers_on_node.
+            aggregation: If given, workers fill AGGREGATION +
+                SYSTEM_METRICS CFs in parallel via SST-backed
+                AggregationVisitors.
+
+        Returns:
+            dict with `total_files`, `per_worker` (sizes), `index_path`,
+            `artifact_batches`, and (if aggregation) `aggregation_files`.
+        """
+        if client is None:
+            try:
+                client = get_client()
+            except ValueError:
+                client = None
+
+        if auto_register_plugin and client is not None:
+            DFTracerAnalyzer._register_dask_plugin()
+
+        result = _distributed_index(
+            directory=directory,
+            files=files,
+            index_path=index_path,
+            local_staging=local_staging,
+            lustre_staging=lustre_staging,
+            client=client,
+            checkpoint_size=checkpoint_size,
+            bloom_dimensions=bloom_dimensions,
+            build_manifest=build_manifest,
+            force_rebuild=force_rebuild,
+            partition=partition,
+            rebuild_root_summaries=rebuild_root_summaries,
+            parallelism_per_worker=parallelism_per_worker,
+            flush_every_files=flush_every_files,
+            aggregation_config=aggregation,
+        )
+
+        return result
 
     @staticmethod
     def _register_dask_plugin():
