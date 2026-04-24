@@ -1027,8 +1027,10 @@ class DFTracerAnalyzer(Analyzer):
 
             from collections import Counter
 
-            # Per-host worker count
-            host_counts = Counter(w["host"] for w in workers.values())
+            def _addr_to_host(addr: str) -> str:
+                return addr.split("://")[-1].rsplit(":", 1)[0]
+
+            host_counts = Counter(_addr_to_host(a) for a in workers.keys())
 
             class _AutoThreadPlugin(DFTracerUtilsDaskWorkerPlugin):
                 def __init__(self, host_worker_counts):
