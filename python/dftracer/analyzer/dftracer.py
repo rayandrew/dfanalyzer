@@ -1027,19 +1027,8 @@ class DFTracerAnalyzer(Analyzer):
 
             from collections import Counter
 
-            # Key the per-host count by the IP derived from worker.address so
-            # it matches the worker-side self-identification in `setup()`
-            # below. Using scheduler_info's `w["host"]` (which can be a
-            # hostname like `corona123`) would mismatch the worker's own
-            # IP-based key lookup and cause every process to fall back to
-            # the default `n_local=1`; with N workers/node that gave each
-            # process all 96 threads, oversubscribing the node N-fold.
-            def _addr_host(addr: str) -> str:
-                return addr.split("://")[-1].rsplit(":", 1)[0]
-
-            host_counts = Counter(
-                _addr_host(w["address"]) for w in workers.values()
-            )
+            # Per-host worker count
+            host_counts = Counter(w["host"] for w in workers.values())
 
             class _AutoThreadPlugin(DFTracerUtilsDaskWorkerPlugin):
                 def __init__(self, host_worker_counts):
