@@ -528,12 +528,18 @@ def _coalesce_cross_worker_duplicates(ddf):
 
 
 def _worker_scan_manifest_to_ipc(agg_ssts, sys_ssts, index_path,
-                                 time_granularity, time_resolution, query):
+                                 time_granularity, time_resolution, query,
+                                 file_hashes=None, host_hashes=None):
     """Dask worker task: scan this worker's slice of the agg manifest.
 
     Opens a scratch IndexDatabase under /tmp, ingests the caller-supplied
     AGG/SYS SSTs into it (RocksDB hard-links them when same-fs), runs the
     dfanalyzer aggregation scan, and returns per-type Arrow IPC bytes.
+
+    When `file_hashes` and `host_hashes` are provided, the C++ side skips
+    opening `index_path` on lustre to resolve hash->name lookups. This
+    matters at scale: without the hoist, every dask worker re-reads the
+    same HASH_TABLES CF from the shared FS.
 
     Emits worker-side timing to stderr so Dask worker logs capture the
     phase breakdown.
@@ -561,6 +567,8 @@ def _worker_scan_manifest_to_ipc(agg_ssts, sys_ssts, index_path,
             time_granularity=time_granularity,
             time_resolution=time_resolution,
             query=query,
+            file_hashes=file_hashes,
+            host_hashes=host_hashes,
         )
         t_scan = time.monotonic()
         result = _batches_to_ipc(batches_by_type)
@@ -1398,6 +1406,15 @@ class DFTracerAnalyzer(Analyzer):
         with log_block("query_file_info"):
             file_id_to_path, file_pids = indexer.query_file_info()
             index_path = os.path.abspath(status.index_path)
+            # Pull hash tables on the coordinator while the indexer is still
+            # open. Scattering these into each manifest-mode worker avoids
+            # N redundant lustre reads of the same HASH_TABLES CF.
+            try:
+                coord_file_hashes = indexer.get_hash_table("file")
+                coord_host_hashes = indexer.get_hash_table("host")
+            except Exception:
+                coord_file_hashes = None
+                coord_host_hashes = None
             indexer.close()
 
         with log_block("dask_client_connect"):
@@ -1423,6 +1440,7 @@ class DFTracerAnalyzer(Analyzer):
                         manifest = _json.load(_f)
                 except Exception:
                     manifest = None
+
 
         event_futures = []
         worker_scan_args = []
@@ -1455,6 +1473,8 @@ class DFTracerAnalyzer(Analyzer):
                         self.time_granularity,
                         self.time_resolution,
                         None,
+                        coord_file_hashes,
+                        coord_host_hashes,
                         workers=[worker_addr] if worker_addr else None,
                         pure=False,
                     )

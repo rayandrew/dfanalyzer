@@ -112,6 +112,18 @@ def test_distributed_index_localcluster_matches_serial(tmp_path):
     assert os.path.exists(index_path)
     assert sum(1 for n in result["per_worker"] if n > 0) >= 1
 
+    # Distributed builds keep aggregation data in per-worker SSTs addressed
+    # by agg_manifest.json; the unified DB's AGGREGATION CF only carries the
+    # config + per-file completion markers. Consolidate to fold the manifest
+    # SSTs into the unified DB so `iter_arrow_dfanalyzer_all` (legacy scan
+    # path) reads real data. This is the portability escape hatch documented
+    # in dftracer.utils.dask.consolidate_index.
+    from dftracer.utils.dask import consolidate_index
+
+    consolidate_result = consolidate_index(index_path)
+    assert consolidate_result.get("consolidated") is True, consolidate_result
+    assert consolidate_result.get("agg_ssts_ingested", 0) >= 1
+
     dist_idx = Indexer(
         files=dist_files,
         index_dir=str(dist_dir),
