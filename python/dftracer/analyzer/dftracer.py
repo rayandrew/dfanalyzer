@@ -478,10 +478,88 @@ def _finalize_view_partials(df, full_cols):
     return out
 
 
-def _worker_scan_to_ipc(files, index_path, time_granularity, time_resolution, query):
-    """Dask worker task: scan aggregation and return Arrow IPC bytes per type.
+def _batches_to_ipc(batches_by_type):
+    """Convert {type: [capsule,...]} from the C extension into {type: IPC bytes}."""
+    result = {}
+    for data_type in ("events", "profiles", "system"):
+        batches = [pa.record_batch(b) for b in batches_by_type.get(data_type, [])]
+        if batches:
+            sink = pa.BufferOutputStream()
+            writer = pa.ipc.new_stream(sink, batches[0].schema)
+            for batch in batches:
+                writer.write_batch(batch)
+            writer.close()
+            result[data_type] = sink.getvalue().to_pybytes()
+        else:
+            result[data_type] = None
+    return result
 
-    Returns compact IPC bytes, not pandas DataFrames, to minimize worker memory.
+
+def _coalesce_cross_worker_duplicates(ddf):
+    """Collapse rows that share the full dimension key across workers.
+
+    When analyze_trace runs against a distributed-shape index, every dask
+    worker scans an independent slice of the agg manifest. Keys that
+    happen to live in more than one slice emit one partial row per slice.
+    All metrics in scan_dfanalyzer_shards are either raw sums
+    (count / time / size) or min/max (time_min / time_max / size_min /
+    size_max / time_start / time_end), so a groupby-aggregate restores
+    one canonical row per key with zero information loss.
+    """
+    group_cols = ["cat", COL_FUNC_NAME, "pid", "tid", "file_hash",
+                  "host_hash", COL_TIME_RANGE]
+    agg_spec = {
+        COL_COUNT: "sum",
+        COL_TIME: "sum",
+        COL_SIZE: "sum",
+        "time_min": "min",
+        "time_max": "max",
+        "size_min": "min",
+        "size_max": "max",
+        COL_TIME_START: "min",
+        COL_TIME_END: "max",
+        COL_FILE_NAME: "first",
+        COL_HOST_NAME: "first",
+        COL_PROC_NAME: "first",
+        COL_IO_CAT: "first",
+        COL_ACC_PAT: "first",
+    }
+    return ddf.groupby(group_cols, dropna=False).agg(agg_spec).reset_index()
+
+
+def _worker_scan_manifest_to_ipc(agg_ssts, sys_ssts, index_path,
+                                 time_granularity, time_resolution, query):
+    """Dask worker task: scan this worker's slice of the agg manifest.
+
+    Opens a scratch IndexDatabase under /tmp, ingests the caller-supplied
+    AGG/SYS SSTs into it (RocksDB hard-links them when same-fs), runs the
+    dfanalyzer aggregation scan, and returns per-type Arrow IPC bytes.
+    """
+    import tempfile
+    import shutil
+    from dftracer.utils.dftracer_utils_ext import scan_aggregation_manifest
+
+    scratch_dir = tempfile.mkdtemp(prefix="dftracer_scan_")
+    try:
+        batches_by_type = scan_aggregation_manifest(
+            agg_ssts or [],
+            sys_ssts or [],
+            scratch_dir,
+            index_path,
+            time_granularity=time_granularity,
+            time_resolution=time_resolution,
+            query=query,
+        )
+        return _batches_to_ipc(batches_by_type)
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+def _worker_scan_to_ipc(files, index_path, time_granularity, time_resolution, query):
+    """Legacy full-scan path for indices without an agg manifest.
+
+    Used when the index was built by single-node `dftracer_index` or has been
+    folded back into a unified shape by `consolidate_index`.
     """
     indexer = Indexer(
         files=files,
@@ -497,19 +575,7 @@ def _worker_scan_to_ipc(files, index_path, time_granularity, time_resolution, qu
         time_resolution=time_resolution,
         query=query,
     )
-    result = {}
-    for data_type in ("events", "profiles", "system"):
-        batches = [pa.record_batch(b) for b in all_batches.get(data_type, [])]
-        if batches:
-            sink = pa.BufferOutputStream()
-            writer = pa.ipc.new_stream(sink, batches[0].schema)
-            for batch in batches:
-                writer.write_batch(batch)
-            writer.close()
-            result[data_type] = sink.getvalue().to_pybytes()
-        else:
-            result[data_type] = None
-    return result
+    return _batches_to_ipc(all_batches)
 
 
 
@@ -1161,11 +1227,48 @@ class DFTracerAnalyzer(Analyzer):
             self._metadata = pd.DataFrame(columns=["name", "value"])
 
         with log_block("cpp_iter_arrow_dfanalyzer"):
-            # Use fused C++ API that scans all types in one pass (~3x faster)
-            all_batches = indexer.iter_arrow_dfanalyzer_all(
-                time_granularity=self.time_granularity,
-                time_resolution=self.time_resolution,
-            )
+            # If a distributed-shape manifest is present, scan every worker's
+            # SSTs in-process (single-node fallback for manifest-only indices).
+            # Otherwise use the unified-DB scan.
+            index_path = os.path.abspath(status.index_path)
+            manifest_path = os.path.join(index_path, "agg_manifest.json")
+            all_batches = None
+            if os.path.exists(manifest_path):
+                import json as _json
+                import tempfile
+                import shutil
+                from dftracer.utils.dftracer_utils_ext import scan_aggregation_manifest
+
+                try:
+                    with open(manifest_path) as _f:
+                        manifest = _json.load(_f)
+                except Exception:
+                    manifest = None
+
+                if manifest and manifest.get("workers"):
+                    agg_ssts = []
+                    sys_ssts = []
+                    for mw in manifest["workers"]:
+                        agg_ssts.extend(mw.get("agg_ssts") or [])
+                        sys_ssts.extend(mw.get("sys_ssts") or [])
+                    scratch_dir = tempfile.mkdtemp(prefix="dftracer_scan_")
+                    try:
+                        all_batches = scan_aggregation_manifest(
+                            agg_ssts,
+                            sys_ssts,
+                            scratch_dir,
+                            index_path,
+                            time_granularity=self.time_granularity,
+                            time_resolution=self.time_resolution,
+                        )
+                    finally:
+                        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+            if all_batches is None:
+                all_batches = indexer.iter_arrow_dfanalyzer_all(
+                    time_granularity=self.time_granularity,
+                    time_resolution=self.time_resolution,
+                )
             event_batches = [pa.record_batch(b) for b in all_batches.get("events", [])]
             profile_batches = [pa.record_batch(b) for b in all_batches.get("profiles", [])]
             system_batches = [pa.record_batch(b) for b in all_batches.get("system", [])]
@@ -1286,38 +1389,86 @@ class DFTracerAnalyzer(Analyzer):
 
             worker_nthreads = dask_client.nthreads()
             n_workers = len(worker_nthreads) or 1
-            all_file_ids = set(file_id_to_path.keys())
-            full_file_pids = {fid: file_pids.get(fid, set()) for fid in all_file_ids}
-            worker_file_ids = _assign_files_by_pid(full_file_pids, n_workers)
             worker_list = list(worker_nthreads.keys())
+
+            manifest_path = os.path.join(index_path, "agg_manifest.json")
+            manifest = None
+            if os.path.exists(manifest_path):
+                import json as _json
+                try:
+                    with open(manifest_path) as _f:
+                        manifest = _json.load(_f)
+                except Exception:
+                    manifest = None
 
             event_futures = []
             worker_scan_args = []
-            for worker_id, fids in worker_file_ids.items():
-                wfiles = [file_id_to_path[fid] for fid in fids if fid in file_id_to_path]
-                if not wfiles:
-                    continue
-                pids = set()
-                for fid in fids:
-                    if fid in file_pids:
-                        pids.update(file_pids[fid])
-                query = None
-                if pids:
-                    pid_conditions = " or ".join(f"pid == {pid}" for pid in sorted(pids))
-                    query = f"({pid_conditions})"
-                worker_addr = worker_list[worker_id % len(worker_list)] if worker_list else None
-                future = dask_client.submit(
-                    _worker_scan_to_ipc,
-                    wfiles,
-                    index_path,
-                    self.time_granularity,
-                    self.time_resolution,
-                    query,
-                    workers=[worker_addr] if worker_addr else None,
-                    pure=False,
-                )
-                event_futures.append(future)
-                worker_scan_args.append((worker_addr, wfiles, query))
+            manifest_mode = bool(manifest and manifest.get("workers"))
+
+            if manifest_mode:
+                # Distributed-shape index: one dask task per manifest worker
+                # entry, each scanning only its own AGG/SYS SSTs. True linear
+                # scaling across N dask workers (up to len(manifest.workers)).
+                #
+                # The scan emits sums (count, dur_total, size_total) and
+                # min/max columns at (cat, name, pid, tid, fhash, hhash,
+                # time_bucket) granularity. Cross-worker duplicates at that
+                # granularity collapse cleanly under a groupby-aggregate
+                # applied below (sum / min / max per column). No per-row
+                # means or stds are emitted, so there is nothing that needs
+                # Welford-style merging.
+                for i, mw in enumerate(manifest["workers"]):
+                    agg_ssts = mw.get("agg_ssts") or []
+                    sys_ssts = mw.get("sys_ssts") or []
+                    if not agg_ssts and not sys_ssts:
+                        continue
+                    worker_addr = worker_list[i % len(worker_list)] if worker_list else None
+                    future = dask_client.submit(
+                        _worker_scan_manifest_to_ipc,
+                        agg_ssts,
+                        sys_ssts,
+                        index_path,
+                        self.time_granularity,
+                        self.time_resolution,
+                        None,
+                        workers=[worker_addr] if worker_addr else None,
+                        pure=False,
+                    )
+                    event_futures.append(future)
+                    # (worker_addr, placeholder files, placeholder query) for
+                    # compat with _distributed_hlm which unpacks a 3-tuple.
+                    worker_scan_args.append((worker_addr, agg_ssts, None))
+            else:
+                # Unified-shape index (single-node build or post-consolidate):
+                # legacy full-scan path with pid-based file partitioning.
+                all_file_ids = set(file_id_to_path.keys())
+                full_file_pids = {fid: file_pids.get(fid, set()) for fid in all_file_ids}
+                worker_file_ids = _assign_files_by_pid(full_file_pids, n_workers)
+                for worker_id, fids in worker_file_ids.items():
+                    wfiles = [file_id_to_path[fid] for fid in fids if fid in file_id_to_path]
+                    if not wfiles:
+                        continue
+                    pids = set()
+                    for fid in fids:
+                        if fid in file_pids:
+                            pids.update(file_pids[fid])
+                    query = None
+                    if pids:
+                        pid_conditions = " or ".join(f"pid == {pid}" for pid in sorted(pids))
+                        query = f"({pid_conditions})"
+                    worker_addr = worker_list[worker_id % len(worker_list)] if worker_list else None
+                    future = dask_client.submit(
+                        _worker_scan_to_ipc,
+                        wfiles,
+                        index_path,
+                        self.time_granularity,
+                        self.time_resolution,
+                        query,
+                        workers=[worker_addr] if worker_addr else None,
+                        pure=False,
+                    )
+                    event_futures.append(future)
+                    worker_scan_args.append((worker_addr, wfiles, query))
 
             self._worker_ipc_futures = event_futures
             self._worker_scan_args = worker_scan_args
@@ -1364,6 +1515,8 @@ class DFTracerAnalyzer(Analyzer):
                 if event_delayed
                 else dd.from_pandas(events_meta, npartitions=1)
             )
+            if manifest_mode and event_delayed:
+                traces = _coalesce_cross_worker_duplicates(traces)
 
             def _has_data(result_dict, key):
                 return result_dict[key] is not None
@@ -1380,6 +1533,8 @@ class DFTracerAnalyzer(Analyzer):
                     for f in event_futures
                 ]
                 profiles = dd.from_delayed(profile_delayed, meta=events_meta)
+                if manifest_mode:
+                    profiles = _coalesce_cross_worker_duplicates(profiles)
             else:
                 profiles = None
             system_metrics = None

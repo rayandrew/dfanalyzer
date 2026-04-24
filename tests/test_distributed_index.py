@@ -138,5 +138,65 @@ def test_distributed_index_localcluster_matches_serial(tmp_path):
             assert s_total == d_total, f"{key}: count sum differs {d_total} vs {s_total}"
 
 
+def test_distributed_index_then_analyze_trace(tmp_path):
+    """Mirrors bench_pipeline_dist.py: phase 1 = build_index_distributed,
+    phase 2 = DFTracerAnalyzer().analyze_trace() on the same cluster+index.
+
+    Exercises the full scaling pipeline flow on a LocalCluster so we can
+    validate locally before submitting to Flux."""
+    from dask.distributed import Client, LocalCluster
+    from omegaconf import OmegaConf
+
+    from dftracer.analyzer.config import AnalyzerPresetConfigPOSIX
+
+    dist_dir = tmp_path / "dist"
+    stage_dir = tmp_path / "stage"
+    dist_dir.mkdir()
+    stage_dir.mkdir()
+
+    files = _make_workload(str(dist_dir), n_files=4, n_events=200)
+    agg = AggregationConfig(time_interval_ms=5000)
+
+    cluster = LocalCluster(n_workers=2, threads_per_worker=1, processes=True)
+    client = Client(cluster)
+    try:
+        client.wait_for_workers(2, timeout=60)
+
+        # Phase 1: distributed index build (also registers _AutoThreadPlugin).
+        DFTracerAnalyzer.build_index_distributed(
+            files=files,
+            index_path=str(dist_dir / ".dftindex"),
+            local_staging=str(stage_dir),
+            lustre_staging=str(stage_dir),
+            client=client,
+            aggregation=agg,
+            auto_register_plugin=True,
+        )
+
+        # Phase 2: instantiate analyzer directly (no init_with_hydra) and
+        # call analyze_trace. read_trace will call _register_dask_plugin a
+        # SECOND time; the idempotency guard (scheduler-address set) must
+        # make that a no-op, otherwise Dask's teardown+re-setup broadcast
+        # hangs on moodycamel ~ImplicitProducer of the previous Runtime.
+        analyzer = DFTracerAnalyzer(
+            preset=OmegaConf.structured(AnalyzerPresetConfigPOSIX()),
+            checkpoint=False,
+            index_dir=str(dist_dir),
+            time_granularity=1.0,
+        )
+        result = analyzer.analyze_trace(
+            trace_path=str(dist_dir),
+            view_types=["time_range"],
+        )
+    finally:
+        client.close()
+        cluster.close()
+
+    # analyze_trace returns an AnalysisResult; loosely assert shape.
+    assert result is not None
+    # Canonical fields on AnalysisResult across the current API.
+    assert hasattr(result, "views") and hasattr(result, "flat_views")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
