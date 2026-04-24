@@ -855,12 +855,19 @@ class DFTracerAnalyzer(Analyzer):
 
         return result
 
+    _plugin_registered_schedulers: "set[str]" = set()
+
     @staticmethod
     def _register_dask_plugin():
         """Register the DFTracer Dask worker plugin if a distributed client is active.
 
         Computes C++ Runtime threads as hardware_concurrency / n_workers_on_node
         so the Runtime uses all available cores without oversubscription.
+
+        Idempotent: re-registering the same plugin on the same scheduler
+        would trigger a teardown+setup round-trip on every worker, which
+        deadlocks if the previous Runtime still has in-flight coroutines. 
+        Skip if already registered for this scheduler address.
         """
         if DFTracerUtilsDaskWorkerPlugin is None:
             return
@@ -868,6 +875,9 @@ class DFTracerAnalyzer(Analyzer):
             import time as _time
 
             client = get_client()
+            sched_addr = getattr(client.scheduler, "address", None) or ""
+            if sched_addr in DFTracerAnalyzer._plugin_registered_schedulers:
+                return
             target = len(client.nthreads())
             workers: Dict[str, Dict] = {}
             for _ in range(30):
@@ -904,6 +914,7 @@ class DFTracerAnalyzer(Analyzer):
                     super().setup(worker)
 
             client.register_plugin(_AutoThreadPlugin(dict(host_counts)))
+            DFTracerAnalyzer._plugin_registered_schedulers.add(sched_addr)
             logger.info(
                 "Registered DFTracerUtilsDaskWorkerPlugin",
                 host_worker_counts=dict(host_counts),
