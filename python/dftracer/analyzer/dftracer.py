@@ -534,12 +534,24 @@ def _worker_scan_manifest_to_ipc(agg_ssts, sys_ssts, index_path,
     Opens a scratch IndexDatabase under /tmp, ingests the caller-supplied
     AGG/SYS SSTs into it (RocksDB hard-links them when same-fs), runs the
     dfanalyzer aggregation scan, and returns per-type Arrow IPC bytes.
+
+    Emits worker-side timing to stderr so Dask worker logs capture the
+    phase breakdown.
     """
-    import tempfile
+    import logging
     import shutil
+    import socket
+    import tempfile
+    import time
+
     from dftracer.utils.dftracer_utils_ext import scan_aggregation_manifest
 
+    logger = logging.getLogger("dftracer.worker_scan_manifest")
+    host = socket.gethostname()
+
+    t0 = time.monotonic()
     scratch_dir = tempfile.mkdtemp(prefix="dftracer_scan_")
+    t_mkdir = time.monotonic()
     try:
         batches_by_type = scan_aggregation_manifest(
             agg_ssts or [],
@@ -550,7 +562,16 @@ def _worker_scan_manifest_to_ipc(agg_ssts, sys_ssts, index_path,
             time_resolution=time_resolution,
             query=query,
         )
-        return _batches_to_ipc(batches_by_type)
+        t_scan = time.monotonic()
+        result = _batches_to_ipc(batches_by_type)
+        t_ipc = time.monotonic()
+        logger.info(
+            "worker_scan_manifest host=%s n_agg=%d n_sys=%d "
+            "mkdir=%.3fs scan+ingest=%.3fs ipc_encode=%.3fs total=%.3fs",
+            host, len(agg_ssts or []), len(sys_ssts or []),
+            t_mkdir - t0, t_scan - t_mkdir, t_ipc - t_scan, t_ipc - t0,
+        )
+        return result
     finally:
         shutil.rmtree(scratch_dir, ignore_errors=True)
 
@@ -1374,11 +1395,12 @@ class DFTracerAnalyzer(Analyzer):
                     system_metrics=None,
                 )
 
-        with log_block("distribute_scan"):
+        with log_block("query_file_info"):
             file_id_to_path, file_pids = indexer.query_file_info()
             index_path = os.path.abspath(status.index_path)
             indexer.close()
 
+        with log_block("dask_client_connect"):
             try:
                 dask_client = client or get_client()
             except ValueError:
@@ -1391,6 +1413,7 @@ class DFTracerAnalyzer(Analyzer):
             n_workers = len(worker_nthreads) or 1
             worker_list = list(worker_nthreads.keys())
 
+        with log_block("load_agg_manifest"):
             manifest_path = os.path.join(index_path, "agg_manifest.json")
             manifest = None
             if os.path.exists(manifest_path):
@@ -1401,10 +1424,11 @@ class DFTracerAnalyzer(Analyzer):
                 except Exception:
                     manifest = None
 
-            event_futures = []
-            worker_scan_args = []
-            manifest_mode = bool(manifest and manifest.get("workers"))
+        event_futures = []
+        worker_scan_args = []
+        manifest_mode = bool(manifest and manifest.get("workers"))
 
+        with log_block("submit_workers"):
             if manifest_mode:
                 # Distributed-shape index: one dask task per manifest worker
                 # entry, each scanning only its own AGG/SYS SSTs. True linear
