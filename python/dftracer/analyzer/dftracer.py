@@ -194,8 +194,38 @@ SYSTEM_OUTPUT_COLUMNS = {
 }
 
 
+def _coerce_arrow_numerics_to_pandas_native(df):
+    """Map pd.ArrowDtype int/float columns to pandas Int64/Float64.
+
+    Downstream analyzer metrics.py divides pandas FloatingArray by these
+    columns; when the RHS is ArrowDtype-int-backed, pandas' masked
+    arithmetic routes through a code path that ends up constructing an
+    IntegerArray from a float ndarray and raises. Coercing to
+    pandas-native nullable dtypes keeps every arithmetic pair on the
+    same code path.
+    """
+    if df.empty:
+        return df
+    for c in df.columns:
+        dt = df[c].dtype
+        if isinstance(dt, pd.ArrowDtype):
+            pa_type = dt.pyarrow_dtype
+            if pa.types.is_floating(pa_type):
+                df[c] = df[c].astype("Float64")
+            elif pa.types.is_integer(pa_type):
+                df[c] = df[c].astype("Int64")
+    return df
+
+
 def _make_empty_hlm(hlm_groupby, hlm_agg, bin_cols):
-    """Return an empty DataFrame matching the HLM meta schema."""
+    """Return an empty DataFrame matching the HLM meta schema.
+
+    Uses pandas-native nullable dtypes (Float64/Int64) rather than
+    pd.ArrowDtype for numeric columns. ArrowDtype mixed with pandas
+    masked FloatingArray in downstream arithmetic (metrics.py) hits a
+    pandas bug where the result's dtype kind is misclassified and
+    IntegerArray.__init__ rejects a float-backing ndarray.
+    """
     int_groupby = {"pid", "tid", "io_cat", "acc_pat", "time_range"}
     time_metric_cols = {
         "time", "time_sq", "time_min", "time_max",
@@ -207,16 +237,16 @@ def _make_empty_hlm(hlm_groupby, hlm_agg, bin_cols):
         if col in hlm_groupby or col in bin_set:
             continue
         if col in time_metric_cols:
-            data_cols[col] = pd.Series(dtype=pd.ArrowDtype(pa.float64()))
+            data_cols[col] = pd.Series(dtype="Float64")
         else:
-            data_cols[col] = pd.Series(dtype=pd.ArrowDtype(pa.int64()))
+            data_cols[col] = pd.Series(dtype="Int64")
     meta = pd.DataFrame(data_cols)
     idx_arrays = []
     for col in hlm_groupby:
         if col in int_groupby:
-            idx_arrays.append(pd.array([], dtype=pd.ArrowDtype(pa.int64())))
+            idx_arrays.append(pd.array([], dtype="Int64"))
         else:
-            idx_arrays.append(pd.array([], dtype=pd.ArrowDtype(pa.string())))
+            idx_arrays.append(pd.array([], dtype="string"))
     if idx_arrays:
         meta.index = pd.MultiIndex.from_arrays(idx_arrays, names=list(hlm_groupby))
     return meta
@@ -291,9 +321,22 @@ def _worker_hlm_partial(ipc_result, data_type, hlm_groupby, hlm_agg, bin_cols):
                 i, field.name, pc.if_else(pc.equal(col, zero), null, col)
             )
 
-    # Zero-copy to pandas; set MultiIndex (names are required by downstream),
-    # skip sort since Dask can't preserve global order across partitions.
+    # Materialize to pandas with native nullable dtypes. ArrowDtype numeric
+    # columns trip a pandas masked-arithmetic bug in downstream metrics.py
+    # (Float64 / ArrowDtype int -> IntegerArray ctor rejects float values).
+    # Keep strings Arrow-backed (common, large, zero-copy friendly) but give
+    # numerics pandas-native Int64/Float64.
     pdf = result.to_pandas(types_mapper=pd.ArrowDtype)
+    for c in pdf.columns:
+        if c in available_groupby:
+            continue
+        dt = pdf[c].dtype
+        if isinstance(dt, pd.ArrowDtype):
+            pa_type = dt.pyarrow_dtype
+            if pa.types.is_floating(pa_type):
+                pdf[c] = pdf[c].astype("Float64")
+            elif pa.types.is_integer(pa_type):
+                pdf[c] = pdf[c].astype("Int64")
     pdf = pdf.set_index(available_groupby)
     t3 = _time.time()
     print(
@@ -1530,6 +1573,7 @@ class DFTracerAnalyzer(Analyzer):
             final.map_partitions(derive_call_stats)
             .map_partitions(set_unique_counts, layer=layer)
             .map_partitions(fix_dtypes, time_sliced=self.time_sliced)
+            .map_partitions(_coerce_arrow_numerics_to_pandas_native)
             .persist()
         )
         return final
