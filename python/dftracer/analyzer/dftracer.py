@@ -1016,21 +1016,28 @@ class DFTracerAnalyzer(Analyzer):
             sched_addr = getattr(client.scheduler, "address", None) or ""
             if sched_addr in DFTracerAnalyzer._plugin_registered_schedulers:
                 return
-            target = len(client.nthreads())
-            workers: Dict[str, Dict] = {}
-            for _ in range(30):
-                scheduler_info = client.scheduler_info()
-                workers = scheduler_info.get("workers", {})
-                if len(workers) >= target:
-                    break
-                _time.sleep(0.5)
-
             from collections import Counter
 
             def _addr_to_host(addr: str) -> str:
                 return addr.split("://")[-1].rsplit(":", 1)[0]
 
-            host_counts = Counter(_addr_to_host(a) for a in workers.keys())
+            nthreads = client.nthreads()
+            for _ in range(10):
+                nthreads_next = client.nthreads()
+                if len(nthreads_next) >= len(nthreads):
+                    nthreads = nthreads_next
+                if len(nthreads) > 0:
+                    break
+                _time.sleep(0.5)
+            host_counts = Counter(_addr_to_host(a) for a in nthreads.keys())
+
+            import logging as _stdlog
+            _stdlog.getLogger("dftracer.dask_plugin").info(
+                "coord register_plugin: host_counts=%s total_workers=%d "
+                "worker_addr_sample=%s",
+                dict(host_counts), sum(host_counts.values()),
+                list(nthreads.keys())[:8],
+            )
 
             class _AutoThreadPlugin(DFTracerUtilsDaskWorkerPlugin):
                 def __init__(self, host_worker_counts):
@@ -1047,10 +1054,13 @@ class DFTracerAnalyzer(Analyzer):
                     n_local = self._host_worker_counts.get(my_host, 1)
                     self.threads = max(1, total_cpus // n_local)
                     import logging as _logging
+                    # Log the actual dict contents we received so we can see
+                    # coord-vs-worker key mismatches unambiguously in the log.
                     _logging.getLogger("distributed.worker").info(
                         "DFTracer Runtime: host=%s cpus=%d workers_on_host=%d "
-                        "cpp_threads=%d",
+                        "cpp_threads=%d dict_keys=%s",
                         my_host, total_cpus, n_local, self.threads,
+                        list(self._host_worker_counts.keys()),
                     )
                     super().setup(worker)
 
