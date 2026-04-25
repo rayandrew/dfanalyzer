@@ -497,6 +497,14 @@ def _batches_to_ipc(batches_by_type):
 
 def _worker_scan_to_ipc(files, index_path, time_granularity, time_resolution, query):
     """Dask worker task: full-scan the unified-DB aggregation CF for `files`."""
+    import logging
+    import socket
+    import time
+
+    logger = logging.getLogger("dftracer.worker_scan")
+    host = socket.gethostname()
+
+    t0 = time.monotonic()
     indexer = Indexer(
         files=files,
         index_dir=os.path.dirname(index_path) if index_path else "",
@@ -506,12 +514,22 @@ def _worker_scan_to_ipc(files, index_path, time_granularity, time_resolution, qu
         require_aggregation=False,
         force_rebuild=False,
     )
+    t_open = time.monotonic()
     all_batches = indexer.iter_arrow_dfanalyzer_all(
         time_granularity=time_granularity,
         time_resolution=time_resolution,
         query=query,
     )
-    return _batches_to_ipc(all_batches)
+    t_scan = time.monotonic()
+    result = _batches_to_ipc(all_batches)
+    t_ipc = time.monotonic()
+    logger.info(
+        "worker_scan host=%s n_files=%d open=%.3fs scan=%.3fs "
+        "ipc_encode=%.3fs total=%.3fs",
+        host, len(files), t_open - t0, t_scan - t_open,
+        t_ipc - t_scan, t_ipc - t0,
+    )
+    return result
 
 
 
