@@ -38,13 +38,8 @@ dependencies = [
     "rich~=14.1.0",
     "strenum>=0.4",
     "structlog>=25",
-    # "dftracer-utils"
-    "dftracer-utils @ git+https://github.com/rayandrew/dftracer-utils.git@perf/improve-reading-in-parallel",
+    "dftracer-utils>=0.0.9"
 ]
-
-# [tool.uv.sources]
-# dftracer-utils = { path = "..", editable = true }
-# dftracer-utils = { git = "https://github.com/rayandrew/dftracer-utils", branch = "perf/improve-reading-in-parallel" }
 
 [project.optional-dependencies]
 darshan = ["darshan>=3.4"]
